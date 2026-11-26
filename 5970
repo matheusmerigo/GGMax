@@ -9950,11 +9950,6 @@ local function storyLoop(mode)
                                 if #act == 3 then
                                     if firstOk and GameClient.isObjActive(nil, "Align_ConductorLink_SU_" .. firstOk) then
                                         pick = firstOk
-                                    else
-                                        for _, i in ipairs(act) do
-                                            if not tried3[i] then pick = i; break end
-                                        end
-                                        if not pick then table.clear(tried3); pick = act[1] end
                                     end
                                     tried3[pick] = true
                                     pullLink(pick)
@@ -16342,6 +16337,7 @@ function Shared.BuildMainUI()
                         end
                         return
                     end
+                    if VoxCore.StopAllMainModes then VoxCore.StopAllMainModes(true, true) end
                     VoxCore.CFG.AutoRaid = false
                     VoxCore.Client.RaidToken = (VoxCore.Client.RaidToken or 0) + 1
                     VoxCore.CFG.AutoFish = false
@@ -18049,6 +18045,15 @@ do
     while lp and lp:GetAttribute("InGame") ~= true and not (lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")) do
         task.wait(0.2)
     end
+    local tCam = os.clock()
+    while os.clock() - tCam < 10 do
+        local cam = workspace.CurrentCamera
+        if cam and cam.ViewportSize.X > 100 and cam.ViewportSize.Y > 100 then
+            break
+        end
+        task.wait(0.1)
+    end
+    task.wait(0.2)
 end
 
 local okBuildUI, errBuildUI = xpcall(function()
