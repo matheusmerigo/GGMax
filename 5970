@@ -16,6 +16,34 @@ local LPH_ENCSTR = LPH_ENCSTR or function(value) return value end
 local LPH_NO_VIRTUALIZE = LPH_NO_VIRTUALIZE or function(callback) return callback end
 
 repeat task.wait() until game:IsLoaded() and game.GameId ~= 0 and game.Players.LocalPlayer
+do
+    local lp = game.Players.LocalPlayer
+    local pg = lp:WaitForChild("PlayerGui", 30)
+    local function isReadyToStart()
+        if lp.Character and lp.Character:FindFirstChild("HumanoidRootPart") then
+            return true
+        end
+        if pg then
+            for _, gui in ipairs(pg:GetChildren()) do
+                if gui:IsA("ScreenGui") and gui.Enabled then
+                    for _, desc in ipairs(gui:GetDescendants()) do
+                        if (desc:IsA("TextButton") or desc:IsA("ImageButton")) and desc.Visible then
+                            local t = ""
+                            pcall(function() t = desc.Text end)
+                            local n = desc.Name:lower()
+                            local tl = type(t) == "string" and t:lower() or ""
+                            if n:find("play") or n:find("start") or n:find("iniciar") or tl:find("play") or tl:find("start") or tl:find("iniciar") or tl:find("jogar") then
+                                return true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return false
+    end
+    repeat task.wait(0.25) until isReadyToStart()
+end
 
 local Now = tick
 
