@@ -18057,20 +18057,7 @@ do
 end
 
 local okBuildUI, errBuildUI = xpcall(function()
-    local rawClamp = math.clamp
-    math.clamp = function(x, mn, mx)
-        if type(mn) == "number" and type(mx) == "number" and mx < mn then
-            mx = mn
-        end
-        return rawClamp(x, mn, mx)
-    end
-    local okUi, errUi = xpcall(function()
-        Shared.BuildMainUI()
-    end, SafeRuntime.Traceback)
-    math.clamp = rawClamp
-    if not okUi then
-        error(errUi, 0)
-    end
+    Shared.BuildMainUI()
 
     -- Wire automation loops and listeners
     Shared.Connections.Toggles = {}
