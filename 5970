@@ -1,6 +1,110 @@
 local getgenv = getgenv or function() return _G end
 local GlobalEnv = getgenv()
-local task = task
+local SafeRuntime = {
+    RawTask = task,
+    Logger = nil,
+}
+function SafeRuntime.Traceback(err)
+    local tb = (type(debug) == "table" and type(debug.traceback) == "function") and debug.traceback("", 2) or ""
+    if tb ~= "" then
+        return tostring(err) .. "\n" .. tb
+    end
+    return tostring(err)
+end
+function SafeRuntime.ReportError(scope, err)
+    local msg = tostring(err)
+    if type(SafeRuntime.Logger) == "function" then
+        pcall(SafeRuntime.Logger, scope, msg)
+    else
+        pcall(warn, "[Midgard:ERR][" .. tostring(scope) .. "] " .. msg)
+    end
+end
+function SafeRuntime.RunResilientLoop(label, condFn, bodyFn, onErr)
+    local errCount = 0
+    while condFn() do
+        local ok, err = xpcall(bodyFn, SafeRuntime.Traceback)
+        if ok then
+            break
+        end
+        errCount += 1
+        SafeRuntime.ReportError(label, ("LOOP_ERR #%d: %s"):format(errCount, tostring(err)))
+        if type(onErr) == "function" then
+            pcall(onErr, err)
+        end
+        if not condFn() then break end
+        SafeRuntime.RawTask.wait(math.min(0.5 + math.min(errCount, 6) * 0.25, 2.0))
+    end
+end
+function SafeRuntime.Connect(signal, label, fn)
+    return signal:Connect(function(...)
+        local args = table.pack(...)
+        local ok, err = xpcall(function()
+            return fn(table.unpack(args, 1, args.n))
+        end, SafeRuntime.Traceback)
+        if not ok then
+            SafeRuntime.ReportError("Conn:" .. tostring(label), err)
+        end
+    end)
+end
+function SafeRuntime.Once(signal, label, fn)
+    return signal:Once(function(...)
+        local args = table.pack(...)
+        local ok, err = xpcall(function()
+            return fn(table.unpack(args, 1, args.n))
+        end, SafeRuntime.Traceback)
+        if not ok then
+            SafeRuntime.ReportError("Once:" .. tostring(label), err)
+        end
+    end)
+end
+local task = {
+    wait = SafeRuntime.RawTask.wait,
+    cancel = SafeRuntime.RawTask.cancel,
+    synchronize = SafeRuntime.RawTask.synchronize,
+    desynchronize = SafeRuntime.RawTask.desynchronize,
+    spawn = function(fn, ...)
+        if type(fn) ~= "function" then
+            return SafeRuntime.RawTask.spawn(fn, ...)
+        end
+        local args = table.pack(...)
+        return SafeRuntime.RawTask.spawn(function()
+            local ok, err = xpcall(function()
+                return fn(table.unpack(args, 1, args.n))
+            end, SafeRuntime.Traceback)
+            if not ok then
+                SafeRuntime.ReportError("task.spawn", err)
+            end
+        end)
+    end,
+    defer = function(fn, ...)
+        if type(fn) ~= "function" then
+            return SafeRuntime.RawTask.defer(fn, ...)
+        end
+        local args = table.pack(...)
+        return SafeRuntime.RawTask.defer(function()
+            local ok, err = xpcall(function()
+                return fn(table.unpack(args, 1, args.n))
+            end, SafeRuntime.Traceback)
+            if not ok then
+                SafeRuntime.ReportError("task.defer", err)
+            end
+        end)
+    end,
+    delay = function(sec, fn, ...)
+        if type(fn) ~= "function" then
+            return SafeRuntime.RawTask.delay(sec, fn, ...)
+        end
+        local args = table.pack(...)
+        return SafeRuntime.RawTask.delay(sec, function()
+            local ok, err = xpcall(function()
+                return fn(table.unpack(args, 1, args.n))
+            end, SafeRuntime.Traceback)
+            if not ok then
+                SafeRuntime.ReportError("task.delay", err)
+            end
+        end)
+    end,
+}
 local game = game
 local workspace = workspace
 local tick = tick
@@ -20,12 +124,19 @@ do
     local lp = game.Players.LocalPlayer
     local pg = lp:WaitForChild("PlayerGui", 30)
     local function isReadyToStart()
-        if lp.Character and lp.Character:FindFirstChild("HumanoidRootPart") then
+        if lp:GetAttribute("InGame") == true or (lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")) then
             return true
         end
         if pg then
+            local lg = pg:FindFirstChild("LoadingScreenUI")
+            if lg and lg:IsA("ScreenGui") and lg.Enabled then
+                return false
+            end
             for _, gui in ipairs(pg:GetChildren()) do
                 if gui:IsA("ScreenGui") and gui.Enabled then
+                    if gui.Name == "StartScreenUI" then
+                        return true
+                    end
                     for _, desc in ipairs(gui:GetDescendants()) do
                         if (desc:IsA("TextButton") or desc:IsA("ImageButton")) and desc.Visible then
                             local t = ""
@@ -58,8 +169,8 @@ local RuntimeRefInfra = {
         xpcall = xpcall,
         table_pack = table.pack,
         unpack = table.unpack or unpack,
-        task_spawn = type(task) == "table" and task.spawn or nil,
-        task_defer = type(task) == "table" and task.defer or nil,
+        task_spawn = SafeRuntime.RawTask.spawn,
+        task_defer = SafeRuntime.RawTask.defer,
         debug_traceback = type(debug) == "table" and debug.traceback or nil,
     },
 }
@@ -1120,6 +1231,14 @@ local function debugLogThrottled(fileName, key, msg, interval)
     debugLog(fileName, msg)
 end
 
+SafeRuntime.Logger = function(scope, msg)
+    local key = tostring(scope) .. ":" .. tostring(msg):sub(1, 80)
+    debugLogThrottled("runtime_errors.txt", key, ("[%s] %s"):format(tostring(scope), tostring(msg)), 3)
+    if WarnAsyncThrottled then
+        WarnAsyncThrottled(tostring(scope), msg)
+    end
+end
+
 -- Configurações
 local CFG = {
     AutoFarm        = false,
@@ -1389,14 +1508,14 @@ function Features.BindCharacterCache(char)
             State.CharJoints[d] = true
         end
     end
-    State.CharConns[#State.CharConns + 1] = char.DescendantAdded:Connect(function(d)
+    State.CharConns[#State.CharConns + 1] = SafeRuntime.Connect(char.DescendantAdded, "CharDescAdded", function(d)
         if d:IsA("BasePart") then
             State.CharParts[d] = true
         elseif d:IsA("Motor6D") then
             State.CharJoints[d] = true
         end
     end)
-    State.CharConns[#State.CharConns + 1] = char.DescendantRemoving:Connect(function(d)
+    State.CharConns[#State.CharConns + 1] = SafeRuntime.Connect(char.DescendantRemoving, "CharDescRemoving", function(d)
         State.CharParts[d] = nil
         State.CharJoints[d] = nil
     end)
@@ -2283,8 +2402,8 @@ function Features.InitCombatCore()
         for _, item in ipairs(folder:GetDescendants()) do
             addItem(item)
         end
-        Combat.telegraphConns[1] = folder.DescendantAdded:Connect(addItem)
-        Combat.telegraphConns[2] = folder.DescendantRemoving:Connect(removeItem)
+        Combat.telegraphConns[1] = SafeRuntime.Connect(folder.DescendantAdded, "TelegraphAdded", addItem)
+        Combat.telegraphConns[2] = SafeRuntime.Connect(folder.DescendantRemoving, "TelegraphRemoved", removeItem)
     end
 
     local function inTelegraph(pos)
@@ -2547,6 +2666,7 @@ function Features.InitCombatCore()
                 lastFarmLog, lastNoTargetT = msg, os.clock()
                 debugLog("farm_debug.txt", msg)
             end
+            SafeRuntime.RunResilientLoop("FarmLoop", function() return not aborted() end, function()
             while not aborted() do
                 local continue_ = false
                 local char, hrp, hum = getChar()
@@ -2641,6 +2761,7 @@ function Features.InitCombatCore()
                     end
                 end
             end
+            end, function(err) attackGoal = nil; currentTarget = nil; cancelTween() end)
             debugLog("farm_debug.txt", "=== AutoFarm STOP ===")
             attackGoal = nil
             cancelTween()
@@ -2651,7 +2772,7 @@ function Features.InitCombatCore()
     -- repetição automática de quest (o jogo oferece "RepeatOffered")
     pcall(function()
         local re = ReplicatedStorage:WaitForChild("NetworkInstances"):WaitForChild("RemoteEvents"):WaitForChild("Quests")
-        track(re.OnClientEvent:Connect(function(ev, offered)
+        track(SafeRuntime.Connect(re.OnClientEvent, "QuestRepeat", function(ev, offered)
             if ev ~= "RepeatOffered" then return end
             local matchFarm = CFG.AutoFarm and CFG.AutoQuest and offered == Features.BestQuest(getLevel())
             local matchMission = false
@@ -2733,9 +2854,9 @@ function Features.InitCombatCore()
             Combat.posedHum = nil
         end
     end
-    track(RunService.Stepped:Connect(applyPose))
-    track(RunService.Heartbeat:Connect(applyPose))
-    track(RunService.RenderStepped:Connect(function()
+    track(SafeRuntime.Connect(RunService.Stepped, "ApplyPoseStepped", applyPose))
+    track(SafeRuntime.Connect(RunService.Heartbeat, "ApplyPoseHeartbeat", applyPose))
+    track(SafeRuntime.Connect(RunService.RenderStepped, "CombatCFrame", function()
         if isCombatActive() then
             local r = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
             if r then
@@ -2747,7 +2868,7 @@ function Features.InitCombatCore()
     end))
 
     -- Mantém pose neutra local em combate via Motor6D.Transform sem destruir Animator
-    track(RunService.PreSimulation:Connect(function()
+    track(SafeRuntime.Connect(RunService.PreSimulation, "PoseReset", function()
         if attackGoal ~= nil and currentTarget ~= nil and not isInCutscene() then
             for joint in pairs(State.CharJoints) do
                 if joint.Parent then
@@ -2792,7 +2913,7 @@ function Features.InitCombatCore()
     end)
 
     -- Noclip
-    track(RunService.Stepped:Connect(function()
+    track(SafeRuntime.Connect(RunService.Stepped, "Noclip", function()
         local userNoclip = (Toggles and Toggles.Noclip and Toggles.Noclip.Value == true)
         if not CFG.Noclip and not userNoclip then
             if State.noclipApplied then
@@ -3044,7 +3165,7 @@ local function addFruit(f, retryCount)
     end
 
     local cAnc
-    cAnc = f.AncestryChanged:Connect(function(_, parent)
+    cAnc = SafeRuntime.Connect(f.AncestryChanged, "FruitAncestry", function(_, parent)
         if not parent or not f:IsDescendantOf(workspace) then
             local cur = Fruits[f]
             clearFruitESP(nil, cur)
@@ -3063,7 +3184,7 @@ local function hookFruitFolder()
     local dt = playability("DroppedTools")
     if dt and hookedDroppedTools ~= dt then
         hookedDroppedTools = dt
-        track(dt.ChildAdded:Connect(function(c) if CFG.FruitDetector then task.defer(addFruit, c) end end))
+        track(SafeRuntime.Connect(dt.ChildAdded, "FruitDroppedAdded", function(c) if CFG.FruitDetector then task.defer(addFruit, c) end end))
     end
     return dt
 end
@@ -3159,7 +3280,7 @@ end
 
 -- atualiza distância no ESP (10Hz para texto + early return quando inativo)
 local lastFruitDistUpdate = 0
-track(RunService.Heartbeat:Connect(function()
+track(SafeRuntime.Connect(RunService.Heartbeat, "FruitESP", function()
     if not CFG.FruitDetector and not CFG.FruitESP and next(Fruits) == nil then
         return
     end
@@ -3263,6 +3384,7 @@ function GameClient.EnsureFruitCollectLoop()
     State.Tokens.FruitCollect += 1
     local myTok = State.Tokens.FruitCollect
     task.spawn(function()
+        SafeRuntime.RunResilientLoop("FruitCollect", function() return CFG.AutoCollectFruit and CFG.FruitDetector and State.Tokens.FruitCollect == myTok end, function()
         while CFG.AutoCollectFruit and CFG.FruitDetector and State.Tokens.FruitCollect == myTok do
             task.wait(0.5)
             if not (CFG.AutoCollectFruit and CFG.FruitDetector and State.Tokens.FruitCollect == myTok) then
@@ -3320,6 +3442,7 @@ function GameClient.EnsureFruitCollectLoop()
                 end
             end
         end
+        end, function(err) collecting = false; cancelTween() end)
     end)
 end
 
@@ -3673,6 +3796,7 @@ function GameClient.EnsureKillAuraLoop()
     debugLog("killaura_debug.txt", "=== KillAura Debug START ===", true)
     local function logKA(msg) debugLog("killaura_debug.txt", msg) end
     task.spawn(function()
+        SafeRuntime.RunResilientLoop("KillAura", function() return CFG.AttackMode == "KillAura" and attackGoal ~= nil and State.Tokens.KillAura == myTok end, function()
         while CFG.AttackMode == "KillAura" and attackGoal ~= nil and State.Tokens.KillAura == myTok do
             if not Combat.ToolIsGun(LP.Character and LP.Character:FindFirstChildOfClass("Tool")) and GameModules and not collecting and not State.storing and not Combat.IsInCutscene() and os.clock() >= Combat.skillCastingUntil then
                 local char, hrp, hum = getChar()
@@ -3780,6 +3904,7 @@ function GameClient.EnsureKillAuraLoop()
             end
             RunService.Heartbeat:Wait()
         end
+        end)
         if State.Tokens.KillAura == myTok then
             State.KillAuraRunning = false
         end
@@ -3927,6 +4052,7 @@ function GameClient.EnsureSkillsLoop()
     logSkill("=== AutoSkills START ===", true)
     task.spawn(function()
         local lastBlockLog = 0
+        SafeRuntime.RunResilientLoop("AutoSkills", function() return CFG.AutoSkills and State.Tokens.Skills == myTok end, function()
         while CFG.AutoSkills and State.Tokens.Skills == myTok do
             if not (hasLiveSkillTarget() and not collecting and not State.storing and not Combat.IsInCutscene()) then
                 local now = os.clock()
@@ -4078,6 +4204,7 @@ function GameClient.EnsureSkillsLoop()
                 end
             end
         end
+        end)
         table.clear(Combat.skillReady)
     end)
 end
@@ -4113,7 +4240,7 @@ do
     end
     local function startFishRender()
         if fishRenderConn then return end
-        fishRenderConn = track(RunService.RenderStepped:Connect(function()
+        fishRenderConn = track(SafeRuntime.Connect(RunService.RenderStepped, "FishRender", function()
             if not CFG.AutoFish then
                 stopFishRender()
                 return
@@ -4422,6 +4549,7 @@ do
             return not CFG.AutoFish or State.Tokens.Fish ~= myTok
         end
         task.spawn(function()
+            SafeRuntime.RunResilientLoop("AutoFish", function() return CFG.AutoFish and State.Tokens.Fish == myTok end, function()
             while CFG.AutoFish and State.Tokens.Fish == myTok do
                 if not CFG.AutoFarm and not collecting then
                     local char, hrp, hum = getChar()
@@ -4516,6 +4644,7 @@ do
                 end
                 task.wait(0.5)
             end
+            end, function(err) cancelTween() end)
             if State.Tokens.Fish == myTok then
                 stopFishRender()
             end
@@ -4525,7 +4654,7 @@ do
 end
 
 -- Anti-AFK
-track(LP.Idled:Connect(function()
+track(SafeRuntime.Connect(LP.Idled, "AntiAFK", function()
     if CFG.AntiAFK then
         Services.VirtualUser:CaptureController()
         Services.VirtualUser:ClickButton2(Vector2.new())
@@ -4573,6 +4702,7 @@ local function startMinigameSolver(aborted)
                 end
             end
         end
+        SafeRuntime.RunResilientLoop("MinigameSolver", function() return not aborted() end, function()
         while not aborted() do
             local pg = LP:FindFirstChild("PlayerGui")
             local dGui = pg and pg:FindFirstChild("DodgeMinigameGui")
@@ -4645,6 +4775,7 @@ local function startMinigameSolver(aborted)
                 task.wait(0.15)
             end
         end
+        end)
     end)
 end
 
@@ -5584,6 +5715,7 @@ local function fightingStyleLoop()
             { cfg = "AutoEletric",     name = "Eletric",       fn = unlockEletric },
         }
 
+        SafeRuntime.RunResilientLoop("FightingStyle", function() return not aborted() end, function()
         while not aborted() do
             local ranAny = false
             for _, st in ipairs(styles) do
@@ -5606,6 +5738,7 @@ local function fightingStyleLoop()
             if not ranAny then break end
             task.wait(0.2)
         end
+        end, function(err) attackGoal = nil; currentTarget = nil; cancelTween() end)
 
         if State.styleToken == my then
             State.styleLoopRunning = false
@@ -7824,7 +7957,7 @@ local function storyLoop(mode)
         GameClient.DebugQuestSnapshot(storyLogFile, mode)
         -- Auto-solver dos minigames (DodgeMinigameGui [Normal/Blind/Spar] + StoneBreakGui)
         GameClient.startMinigameSolver(aborted)
-        local okStory, errStory = xpcall(function()
+        SafeRuntime.RunResilientLoop("StoryLoop:" .. tostring(mode), function() return not aborted() end, function()
         while not aborted() do
             local char, hrp, hum = getChar()
             local pgNow = LP:FindFirstChild("PlayerGui")
@@ -10202,16 +10335,16 @@ local function storyLoop(mode)
         end
         end
         end
-        end, debug.traceback)
-        if not okStory and errStory then
-            logSec("STORY_CRASH: " .. tostring(errStory))
+        end, function(err)
+            logSec("STORY_ERR: " .. tostring(err))
             GameClient.DebugQuestSnapshot(storyLogFile, mode)
-            Status = "Erro: " .. tostring(errStory)
-        else
-            logSec(("=== LOOP STOP mode=%s autoHistory=%s autoSecondary=%s autoVox=%s ==="):format(
-                tostring(mode), tostring(CFG.AutoHistory), tostring(CFG.AutoSecondary), tostring(CFG.AutoVoxTraining)
-            ))
-        end
+            attackGoal = nil
+            currentTarget = nil
+            cancelTween()
+        end)
+        logSec(("=== LOOP STOP mode=%s autoHistory=%s autoSecondary=%s autoVox=%s ==="):format(
+            tostring(mode), tostring(CFG.AutoHistory), tostring(CFG.AutoSecondary), tostring(CFG.AutoVoxTraining)
+        ))
     end)
 end
 
@@ -10391,6 +10524,7 @@ function GameClient.BossLoop()
         end
         local bossIdx = 1
         local activeBossName = nil
+        SafeRuntime.RunResilientLoop("BossLoop", function() return not aborted() end, function()
         while not aborted() do
             local char, hrp, hum = getChar()
             if isDeadOrRespawning() or (not State.bossBusy and (State.seaBeastBusy or State.fortRaidBusy or State.islandBossBusy)) or not (char and hrp and hum) then
@@ -10624,6 +10758,7 @@ function GameClient.BossLoop()
                 end
             end
         end
+        end, function(err) State.bossBusy = false; attackGoal = nil; currentTarget = nil; cancelTween() end)
         State.bossBusy = false
         attackGoal = nil
         currentTarget = nil
@@ -10732,6 +10867,7 @@ function GameClient.IslandBossLoop()
             end
             return aborted() or isDeadOrRespawning() or State.seaBeastBusy or State.fortRaidBusy or State.bossBusy
         end
+        SafeRuntime.RunResilientLoop("IslandBossLoop", function() return not aborted() end, function()
         while not aborted() do
             local char, hrp, hum = getChar()
             if isDeadOrRespawning() or (not State.islandBossBusy and (State.seaBeastBusy or State.fortRaidBusy or State.bossBusy)) or not (char and hrp and hum) then
@@ -10864,6 +11000,7 @@ function GameClient.IslandBossLoop()
                 end
             end
         end
+        end, function(err) State.islandBossBusy = false; attackGoal = nil; currentTarget = nil; cancelTween() end)
         State.islandBossBusy = false
         State.bossBusy = false
         attackGoal = nil
@@ -11097,6 +11234,7 @@ function GameClient.StartRaidLoop()
             nextRaidAt = os.clock() + RAID_INTERVAL
             return true
         end
+        SafeRuntime.RunResilientLoop("RaidLoop", function() return not aborted() end, function()
         while not aborted() do
             local settings = MainModules and MainModules.BossRoomsSettings
             local activePayload = GameClient.BossRoomsFight and GameClient.BossRoomsFight.Payload
@@ -11301,6 +11439,7 @@ function GameClient.StartRaidLoop()
             end
             fightAndReturn(settings, bossName, keeperPos, target)
         end
+        end, function(err) attackGoal = nil; currentTarget = nil; cancelTween() end)
         if token == GameClient.RaidToken then
             State.raidInArena = false
         end
@@ -11525,6 +11664,7 @@ function GameClient.StartFortRaidLoop()
                 end
             end
         end
+        SafeRuntime.RunResilientLoop("FortRaidLoop", function() return not aborted() end, function()
         while not aborted() do
             if getLevel() < 325 then
                 Status = "Fort Raid: requer nível 325"
@@ -11639,6 +11779,7 @@ function GameClient.StartFortRaidLoop()
                 task.wait(1)
             end
         end
+        end, function(err) State.fortRaidBusy = false; attackGoal = nil; currentTarget = nil; cancelTween() end)
         State.fortRaidBusy = false
         attackGoal = nil
         currentTarget = nil
@@ -11760,6 +11901,7 @@ do
             end
             local lastRunPoll, lastSkippedWave, lastCardWave, lastCardRoll = 0, -1, -1, -1
             debugLog("dungeon_debug.txt", ("=== DUNGEON START inPlace=%s ==="):format(tostring(isInDungeonPlace())), true)
+            SafeRuntime.RunResilientLoop("DungeonLoop", function() return not aborted() end, function()
             while not aborted() do
                 if isInDungeonLobbyPlace() then
                     if isDeadOrRespawning() or State.bossBusy or State.islandBossBusy or State.seaBeastBusy or State.fortRaidBusy or collecting then
@@ -11877,6 +12019,7 @@ do
                     end
                 end
             end
+            end, function(err) attackGoal = nil; currentTarget = nil; cancelTween() end)
             attackGoal = nil
             currentTarget = nil
             if Movement and Movement.Stop then Movement.Stop() end
@@ -12253,6 +12396,7 @@ function GameClient.EnsureInventoryLoop()
     State.Tokens.Inventory += 1
     local myTok = State.Tokens.Inventory
     task.spawn(function()
+        SafeRuntime.RunResilientLoop("InventoryLoop", function() return (CFG.AutoDeleteInventory or CFG.AutoBankMaterials) and State.Tokens.Inventory == myTok end, function()
         while (CFG.AutoDeleteInventory or CFG.AutoBankMaterials) and State.Tokens.Inventory == myTok do
             local wDel = CFG.AutoDeleteInventory and Features.HasCategoryTargets(CFG.InventoryDeleteTargets)
             local wBank = CFG.AutoBankMaterials and Features.HasCategoryTargets(CFG.BankTargets)
@@ -12270,6 +12414,7 @@ function GameClient.EnsureInventoryLoop()
             end
             task.wait(1)
         end
+        end, function(err) GameClient.InventoryAutomationBusy = false end)
     end)
 end
 
@@ -12450,7 +12595,7 @@ Features.SeaBeastLoop = function()
             local re = ni and ni:FindFirstChild("RemoteEvents")
             local castEv = re and re:FindFirstChild("Elysium_Casting")
             if castEv then
-                track(castEv.OnClientEvent:Connect(function(action, _tok, _kind, key)
+                track(SafeRuntime.Connect(castEv.OnClientEvent, "SeaBeastCast", function(action, _tok, _kind, key)
                     if type(key) == "string" and (key:find("Sea Beast:", 1, true) ~= nil or key:find("Abyssal Beast:", 1, true) ~= nil) then
                         local skillName = key:match(":(.+)$")
                         if not (skillName and SEA_BEAST_DODGE_SKILLS[skillName]) then return end
@@ -12468,7 +12613,7 @@ Features.SeaBeastLoop = function()
             local ure = ni and ni:FindFirstChild("UnreliableRemoteEvents")
             local leapEv = ure and ure:FindFirstChild("SeaBeastLeap")
             if leapEv then
-                track(leapEv.OnClientEvent:Connect(function(model, _startTime, _baseCF, _lift)
+                track(SafeRuntime.Connect(leapEv.OnClientEvent, "SeaBeastLeap", function(model, _startTime, _baseCF, _lift)
                     if typeof(model) == "Instance" and model:IsA("Model") then
                         State.seaBeastActiveSkills = State.seaBeastActiveSkills or {}
                         State.seaBeastActiveSkills["Sea Beast:LeapGrab"] = os.clock() + 3.0
@@ -12489,6 +12634,7 @@ Features.SeaBeastLoop = function()
     end
     task.spawn(function()
         local warnedLv = false
+        SafeRuntime.RunResilientLoop("SeaBeastLoop", function() return CFG.AutoSeaBeast and State.seaBeastToken == myTok end, function()
         while CFG.AutoSeaBeast and State.seaBeastToken == myTok do
             if isDeadOrRespawning() then
                 attackGoal = nil
@@ -12571,6 +12717,7 @@ Features.SeaBeastLoop = function()
                 end
             end
         end
+        end, function(err) State.seaBeastBusy = false; attackGoal = nil; currentTarget = nil; cancelTween() end)
         State.seaBeastBusy = false
         logSB(("=== AutoSeaBeast STOP (AutoSeaBeast=%s tok=%d/%d) ==="):format(tostring(CFG.AutoSeaBeast), myTok, State.seaBeastToken))
     end)
@@ -12871,10 +13018,12 @@ Features.MissionLoop = function()
     end
     task.spawn(function()
         local hadActiveQuest = false
+        SafeRuntime.RunResilientLoop("MissionLoop", function() return CFG.AutoMob and State.mobToken == myTok end, function()
         while CFG.AutoMob and State.mobToken == myTok do
             if isDeadOrRespawning() or collecting or State.bossBusy or State.islandBossBusy or State.seaBeastBusy or State.fortRaidBusy then
                 attackGoal = nil
                 currentTarget = nil
+                if isDeadOrRespawning() then Status = "Aguardando respawn..." end
                 logMobThrottled(("PAUSED dead=%s collecting=%s bossBusy=%s seaBeastBusy=%s fortRaidBusy=%s"):format(tostring(isDeadOrRespawning()), tostring(collecting), tostring(State.bossBusy or State.islandBossBusy), tostring(State.seaBeastBusy), tostring(State.fortRaidBusy)))
                 task.wait(0.4)
             else
@@ -13049,6 +13198,7 @@ Features.MissionLoop = function()
                 end
             end
         end
+        end, function(err) attackGoal = nil; currentTarget = nil; cancelTween() end)
         logMob(("=== MissionLoop STOP (AutoMob=%s tok=%d/%d) ==="):format(tostring(CFG.AutoMob), myTok, State.mobToken))
     end)
 end
@@ -13419,6 +13569,7 @@ function GameClient.ApplyCollectibles(on, continueQueue, requestedMode)
         logCollectibles(("SCAN root=%s folder=%s loaded=%d savedTotal=%d savedIsland=%d names=[%s]"):format(
             tostring(root), tostring(islandFolder), #loadedNames, savedTotal, savedOnIsland, table.concat(loadedNames, " | ")
         ))
+        SafeRuntime.RunResilientLoop("CollectiblesLoop", function() return not aborted() end, function()
         while not aborted() do
             local _, hrp = getChar()
             if not hrp then task.wait(0.5); continue end
@@ -13508,6 +13659,7 @@ function GameClient.ApplyCollectibles(on, continueQueue, requestedMode)
             end
             task.wait(0.15)
         end
+        end, function(err) logCollectibles("LOOP_ERR " .. tostring(err)); cancelTween() end)
 
         if not aborted() then
             cancelTween()
@@ -13839,7 +13991,7 @@ function Features.HookDeath(char)
         if hum and LP.Character == char then
             local downed = false
             local reviveToken = 0
-            local cDied = hum.Died:Once(function()
+            local cDied = SafeRuntime.Once(hum.Died, "HumDied", function()
                 downed = true
                 reviveToken += 1
                 State.isRespawning = true
@@ -13850,7 +14002,7 @@ function Features.HookDeath(char)
             end)
             table.insert(State.DeathConns, cDied)
             -- Morte "customizada" do jogo: a vida vai a 0 e o MESMO personagem é revivido/teleportado (sem CharacterAdded)
-            local cHp = hum.HealthChanged:Connect(function(hp)
+            local cHp = SafeRuntime.Connect(hum.HealthChanged, "HumHealthChanged", function(hp)
                 if hp <= 0 then
                     if not downed then
                         downed = true
@@ -13890,13 +14042,13 @@ if LP.Character then
     Features.HookDeath(LP.Character)
 end
 
-track(LP.CharacterAdded:Connect(function(newChar)
+track(SafeRuntime.Connect(LP.CharacterAdded, "CharacterAdded", function(newChar)
     State.isRespawning = true
     attackGoal = nil
     currentTarget = nil
     cancelTween()
-    Features.BindCharacterCache(newChar)
-    Features.HookDeath(newChar)
+    pcall(Features.BindCharacterCache, newChar)
+    pcall(Features.HookDeath, newChar)
     Status = "Renasceu, aguardando 3s..."
     local tWait = os.clock() + 10
     while os.clock() < tWait and not getChar() do
@@ -13989,6 +14141,7 @@ task.spawn(function()
         loading = loading and loading:FindFirstChild("LoadingScreen")
         if loading and loading:IsA("ModuleScript") then loadingModule = require(loading) end
     end)
+    SafeRuntime.RunResilientLoop("AutoStartScreen", function() return LP:GetAttribute("InGame") ~= true end, function()
     while LP:GetAttribute("InGame") ~= true do
         local loadingDone = ReplicatedStorage:GetAttribute("LoadingCompleted") == true
         local collapseDone = not loadingModule or loadingModule.Finished == true
@@ -14008,6 +14161,7 @@ task.spawn(function()
         end
         task.wait(0.05)
     end
+    end)
 end)
 
 do
@@ -14041,9 +14195,9 @@ local function ensureFruitHopInit()
         if ok and type(data) == "table" then visited = data end
     end
     if joinData and joinData.TeleportFailed then
-        pcall(function() track(joinData.TeleportFailed:Connect(function(r) pendingFail = tostring(r or "Failed") end)) end)
+        pcall(function() track(SafeRuntime.Connect(joinData.TeleportFailed, "TeleportFailed", function(r) pendingFail = tostring(r or "Failed") end)) end)
     end
-    track(TeleportService.TeleportInitFailed:Connect(function(p, r)
+    track(SafeRuntime.Connect(TeleportService.TeleportInitFailed, "TeleportInitFailed", function(p, r)
         if p == LP then pendingFail = tostring(r) end
     end))
 end
@@ -14130,6 +14284,7 @@ function GameClient.EnsureFruitHopLoop()
         return false
     end
     task.spawn(function()
+        SafeRuntime.RunResilientLoop("FruitHopLoop", function() return (CFG.AutoFruitHop or CFG.AutoUniversalHop) and State.Tokens.FruitHop == myTok end, function()
         while (CFG.AutoFruitHop or CFG.AutoUniversalHop) and State.Tokens.FruitHop == myTok do
             if LP:GetAttribute("InGame") ~= true then
                 task.wait(0.5)
@@ -14184,6 +14339,7 @@ function GameClient.EnsureFruitHopLoop()
                 failCount[target.JobId] = (failCount[target.JobId] or 0) + 1
             end
         end
+        end)
     end)
 end
 end
@@ -14201,6 +14357,7 @@ function Features.InitWatchdogs()
     local myTok = State.Tokens.Watchdogs
     local sunkAt, clientStuckAt, discoveryAt = nil, nil, nil
     local presentSeenAt, presentClaimAt, presentLastClickAt = nil, nil, nil
+    local respawningSince = nil
     local function anyAutoActive()
         return CFG.AutoFarm or CFG.AutoMob or CFG.AutoBoss or CFG.AutoBoardBoss or CFG.AutoIslandBoss or CFG.AutoRaid
             or CFG.AutoFortRaid or CFG.AutoSeaBeast or CFG.AutoHistory or CFG.AutoSecondary
@@ -14330,6 +14487,16 @@ function Features.InitWatchdogs()
                 else
                     discoveryAt = nil
                     presentSeenAt, presentClaimAt, presentLastClickAt = nil, nil, nil
+                end
+                if State.isRespawning then
+                    respawningSince = respawningSince or os.clock()
+                    if (os.clock() - respawningSince) > 10 and os.clock() >= (State.respawnReadyAt or 0) and getChar() ~= nil then
+                        State.isRespawning = false
+                        respawningSince = nil
+                        SafeRuntime.ReportError("Watchdog", "Cleared stuck State.isRespawning")
+                    end
+                else
+                    respawningSince = nil
                 end
             end)
         end
@@ -15016,6 +15183,7 @@ function Features.InitKeyCraft()
             local outPerCraft = math.max(1, tonumber(baseReq and baseReq.OutputAmount) or 1)
             local goalCnt = startCnt + wantQty * outPerCraft
             logKey(("GOAL key=%s startCnt=%d outPerCraft=%d wantQty=%d goalCnt=%d"):format(tostring(entry.Name), startCnt, outPerCraft, wantQty, goalCnt))
+            SafeRuntime.RunResilientLoop("KeyCraftLoop", function() return not aborted() end, function()
             while not aborted() do
                 local curCnt = (MainModules and MainModules.ToolsUtils and MainModules.ToolsUtils.GetInventoryAmount(nil, entry.Name)) or 0
                 if curCnt >= goalCnt then
@@ -15043,6 +15211,7 @@ function Features.InitKeyCraft()
                 end
                 task.wait(0.25)
             end
+            end, function(err) cancelTween() end)
             if State.Tokens.KeyCraft == myTok then
                 State.activeFarmQuestName = nil
                 CFG.AutoCraftRaidKey = false
@@ -15088,6 +15257,7 @@ function Features.InitKeyCraft()
                 tostring(itemName), tostring(baseReq.Unique), startCnt, outPerCraft, wantQty, goalCnt, tonumber(baseReq.Level) or 0, tonumber(baseReq.Gold) or 0
             ))
 
+            SafeRuntime.RunResilientLoop("BlacksmithLoop", function() return not aborted() end, function()
             while not aborted() do
                 local curCnt = (MainModules and MainModules.ToolsUtils and MainModules.ToolsUtils.GetInventoryAmount(nil, itemName)) or 0
                 if curCnt >= goalCnt then
@@ -15115,6 +15285,7 @@ function Features.InitKeyCraft()
                 end
                 task.wait(0.25)
             end
+            end, function(err) cancelTween() end)
             if State.Tokens.Blacksmith == myTok then
                 State.activeFarmQuestName = nil
                 CFG.AutoBlacksmith = false
@@ -15227,6 +15398,7 @@ function Features.InitKeyCraft()
                 notify("Blacksmith", "Selecione um equipamento válido primeiro.")
                 return
             end
+            SafeRuntime.RunResilientLoop("ForgeUpgradeLoop", function() return not aborted() end, function()
             while not aborted() do
                 local entry = findBestGearEntry(gearName, mode)
                 local info = MainModules and MainModules.ToolsInfo and MainModules.ToolsInfo:Get(gearName)
@@ -15401,6 +15573,7 @@ function Features.InitKeyCraft()
                 Features.RestoreHud()
                 task.wait(0.35)
             end
+            end, function(err) cancelTween() end)
             if State.Tokens.ForgeUpgrade == myTok then
                 State.activeFarmQuestName = nil
                 CFG.AutoForgeUpgrade = false
@@ -15454,6 +15627,7 @@ function Features.InitKeyCraft()
                 return not CFG.AutoMobDrops or State.Tokens.MobDrop ~= myTok
             end
             ensureKeyCatalog()
+            SafeRuntime.RunResilientLoop("MobDropLoop", function() return not aborted() end, function()
             while not aborted() do
                 local missingRows = {}
                 for itemName, active in pairs(CFG.TargetMobDrops or {}) do
@@ -15487,6 +15661,7 @@ function Features.InitKeyCraft()
                 end
                 task.wait(0.25)
             end
+            end, function(err) attackGoal = nil; currentTarget = nil; cancelTween() end)
             if State.Tokens.MobDrop == myTok then
                 State.activeFarmQuestName = nil
                 CFG.AutoMobDrops = false
@@ -15565,6 +15740,7 @@ do
         State.Tokens.BlackMarket = (State.Tokens.BlackMarket or 0) + 1
         local myTok = State.Tokens.BlackMarket
         task.spawn(function()
+            SafeRuntime.RunResilientLoop("BlackMarketLoop", function() return CFG.AutoBlackMarket and State.Tokens.BlackMarket == myTok end, function()
             while CFG.AutoBlackMarket and State.Tokens.BlackMarket == myTok do
                 task.wait(3)
                 if not (CFG.AutoBlackMarket and State.Tokens.BlackMarket == myTok) then break end
@@ -15640,6 +15816,7 @@ do
                     end
                 end
             end
+            end, function(err) cancelTween() end)
         end)
     end
 end
@@ -16501,7 +16678,7 @@ function Shared.BuildMainUI()
             end,
         })
         if secretToggle and secretToggle.Holder and secretToggle.Holder:IsA("GuiButton") then
-            secretToggle.Holder.MouseButton1Click:Connect(function()
+            SafeRuntime.Connect(secretToggle.Holder.MouseButton1Click, "SecretToggleClick", function()
                 if VoxCore and VoxCore.Client and VoxCore.Client.SecretDebugLog then
                     VoxCore.Client.SecretDebugLog(("RAW_CLICK togVal=%s disabled=%s unloaded=%s refreshing=%s"):format(
                         tostring(secretToggle.Value), tostring(secretToggle.Disabled),
@@ -16687,6 +16864,7 @@ function Shared.BuildMainUI()
                 end
                 return (#parts > 0) and table.concat(parts, " | ") or "-"
             end
+            SafeRuntime.RunResilientLoop("BossStatusUILoop", function() return not (Library and Library.Unloaded) end, function()
             while not (Library and Library.Unloaded) do
                 local okTick, errTick = pcall(function()
                     local lines = {}
@@ -16737,6 +16915,7 @@ function Shared.BuildMainUI()
                 end)
                 task.wait(1)
             end
+            end)
         end)
     end
 
@@ -17865,22 +18044,34 @@ Shared.PostToWebhook = PostPlayerAlert
 Shared.SaveManager = SaveManager
 Shared.SaveManager:SetLibrary(Library)
 
-Shared.BuildMainUI()
-
--- Wire automation loops and listeners
-Shared.Connections.Toggles = {}
-
--- Wire Noclip
-if Toggles.Noclip then
-    Toggles.Noclip:OnChanged(function(v)
-        if VoxCore and VoxCore.CFG then
-            VoxCore.CFG.Noclip = (v == true) or VoxCore.CFG.Noclip
-        end
-        if v == true then
-            Shared.ApplyNoclip()
-        end
-    end)
+do
+    local lp = game:GetService("Players").LocalPlayer
+    while lp and lp:GetAttribute("InGame") ~= true and not (lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")) do
+        task.wait(0.2)
+    end
 end
 
--- Initialize Toggles
-Shared.InitializeOptimizationToggles()
+local okBuildUI, errBuildUI = xpcall(function()
+    Shared.BuildMainUI()
+
+    -- Wire automation loops and listeners
+    Shared.Connections.Toggles = {}
+
+    -- Wire Noclip
+    if Toggles.Noclip then
+        Toggles.Noclip:OnChanged(function(v)
+            if VoxCore and VoxCore.CFG then
+                VoxCore.CFG.Noclip = (v == true) or VoxCore.CFG.Noclip
+            end
+            if v == true then
+                Shared.ApplyNoclip()
+            end
+        end)
+    end
+
+    -- Initialize Toggles
+    Shared.InitializeOptimizationToggles()
+end, SafeRuntime.Traceback)
+if not okBuildUI then
+    SafeRuntime.ReportError("BuildMainUI", errBuildUI)
+end
