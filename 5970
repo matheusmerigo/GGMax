@@ -1,17 +1,19 @@
+--!optimize 2
 local getgenv = getgenv or function() return _G end
 local GlobalEnv = getgenv()
 local SafeRuntime = {
     RawTask = task,
     Logger = nil,
+    OnLoopThread = nil,
 }
-function SafeRuntime.Traceback(err)
+function SafeRuntime.Traceback(err: any): string
     local tb = (type(debug) == "table" and type(debug.traceback) == "function") and debug.traceback("", 2) or ""
     if tb ~= "" then
         return tostring(err) .. "\n" .. tb
     end
     return tostring(err)
 end
-function SafeRuntime.ReportError(scope, err)
+function SafeRuntime.ReportError(scope: string, err: any)
     local msg = tostring(err)
     if type(SafeRuntime.Logger) == "function" then
         pcall(SafeRuntime.Logger, scope, msg)
@@ -19,7 +21,10 @@ function SafeRuntime.ReportError(scope, err)
         pcall(warn, "[Midgard:ERR][" .. tostring(scope) .. "] " .. msg)
     end
 end
-function SafeRuntime.RunResilientLoop(label, condFn, bodyFn, onErr)
+function SafeRuntime.RunResilientLoop(label: string, condFn: () -> boolean, bodyFn: () -> (), onErr: ((any) -> ())?)
+    if type(SafeRuntime.OnLoopThread) == "function" then
+        pcall(SafeRuntime.OnLoopThread, label)
+    end
     local errCount = 0
     while condFn() do
         local ok, err = xpcall(bodyFn, SafeRuntime.Traceback)
@@ -35,7 +40,7 @@ function SafeRuntime.RunResilientLoop(label, condFn, bodyFn, onErr)
         SafeRuntime.RawTask.wait(math.min(0.5 + math.min(errCount, 6) * 0.25, 2.0))
     end
 end
-function SafeRuntime.Connect(signal, label, fn)
+function SafeRuntime.Connect(signal: RBXScriptSignal, label: string, fn: (...any) -> ()): RBXScriptConnection
     return signal:Connect(function(...)
         local args = table.pack(...)
         local ok, err = xpcall(function()
@@ -46,7 +51,7 @@ function SafeRuntime.Connect(signal, label, fn)
         end
     end)
 end
-function SafeRuntime.Once(signal, label, fn)
+function SafeRuntime.Once(signal: RBXScriptSignal, label: string, fn: (...any) -> ()): RBXScriptConnection
     return signal:Once(function(...)
         local args = table.pack(...)
         local ok, err = xpcall(function()
@@ -166,7 +171,7 @@ local function GetSafeHttpRequestFunction()
     return nil, nil
 end
 
-local function pruneOldestTickEntries(cache, maxEntries)
+local function PruneOldestTickEntries(cache, maxEntries)
     if type(cache) ~= "table" then return end
     maxEntries = tonumber(maxEntries) or 0
     if maxEntries <= 0 then return end
@@ -519,7 +524,7 @@ function Shared.PruneThrottleCache(now)
             end
         end
     end
-    pruneOldestTickEntries(Shared.Throttles, 512)
+    PruneOldestTickEntries(Shared.Throttles, 512)
     return true
 end
 
@@ -531,7 +536,7 @@ function Shared.UseThrottle(key)
     Shared.Throttles[key] = now
     Shared._ThrottleWriteCount = ((tonumber(Shared._ThrottleWriteCount) or 0) + 1) % 64
     if not pruned and Shared._ThrottleWriteCount == 0 then
-        pruneOldestTickEntries(Shared.Throttles, 512)
+        PruneOldestTickEntries(Shared.Throttles, 512)
     end
 end
 
@@ -861,6 +866,33 @@ local Movement = {
     lastInteractAt = 0,
     noclipOverlap = OverlapParams.new(),
     unsinkRay = RaycastParams.new(),
+    OwnerName = nil,
+    OwnerPriority = 0,
+    OwnerThread = nil,
+    OwnerLeaseUntil = 0,
+    ThreadTags = setmetatable({}, { __mode = "k" }),
+    PRIORITIES = {
+        ManualTravel = 100,
+        BlackMarketTeleport = 100,
+        FruitCollect = 95,
+        BlackMarketLoop = 95,
+        DungeonLoop = 90,
+        RaidLoop = 90,
+        SeaBeastLoop = 80,
+        FortRaidLoop = 80,
+        BossLoop = 75,
+        IslandBossLoop = 75,
+        StoryLoop = 55,
+        FarmLoop = 50,
+        MissionLoop = 50,
+        FightingStyle = 50,
+        KeyCraftLoop = 45,
+        BlacksmithLoop = 45,
+        ForgeUpgradeLoop = 45,
+        MobDropLoop = 45,
+        CollectiblesLoop = 45,
+        AutoFish = 40,
+    },
 }
 Movement.noclipOverlap.FilterType = Enum.RaycastFilterType.Exclude
 Movement.unsinkRay.FilterType = Enum.RaycastFilterType.Exclude
@@ -896,13 +928,24 @@ Combat.losParams.IgnoreWater = true
 local Features = {}
 
 pcall(function() if makefolder and (not isfolder or not isfolder(Services.DEBUG_DIR)) then makefolder(Services.DEBUG_DIR) end end)
-local function debugLog(fileName, msg, reset)
+local _debugWriteCount = {}
+local function LogDebug(fileName, msg, reset)
     pcall(function()
         local path = Services.DEBUG_DIR .. "/" .. fileName
         local line = string.format("[%s] %s\n", os.date("%H:%M:%S"), tostring(msg))
         if reset and writefile then
+            _debugWriteCount[fileName] = 0
             writefile(path, line)
         elseif appendfile and isfile and isfile(path) then
+            local n = (_debugWriteCount[fileName] or 0) + 1
+            _debugWriteCount[fileName] = n
+            if n % 100 == 0 and readfile and writefile then
+                local content = readfile(path)
+                if type(content) == "string" and #content > 250000 then
+                    writefile(path, content:sub(-100000) .. line)
+                    return
+                end
+            end
             appendfile(path, line)
         elseif writefile then
             writefile(path, line)
@@ -911,17 +954,33 @@ local function debugLog(fileName, msg, reset)
 end
 
 local _debugThrottle = {}
-local function debugLogThrottled(fileName, key, msg, interval)
+local _debugThrottleCount = 0
+local function LogDebugThrottled(fileName, key, msg, interval)
     local now = os.clock()
     local k = fileName .. "|" .. tostring(key)
     if now - (_debugThrottle[k] or 0) < (interval or 2) then return end
     _debugThrottle[k] = now
-    debugLog(fileName, msg)
+    _debugThrottleCount = (_debugThrottleCount + 1) % 64
+    if _debugThrottleCount == 0 then
+        local cutoff = now - 300
+        for tk, tv in pairs(_debugThrottle) do
+            if type(tv) ~= "number" or tv < cutoff then _debugThrottle[tk] = nil end
+        end
+        PruneOldestTickEntries(_debugThrottle, 256)
+    end
+    LogDebug(fileName, msg)
+end
+
+local function LogDebugEvent(fileName, tag, msg, reset)
+    LogDebug(fileName, ("[%s] %s"):format(tostring(tag), tostring(msg)), reset)
+end
+local function LogDebugEventThrottled(fileName, key, tag, msg, interval)
+    LogDebugThrottled(fileName, key, ("[%s] %s"):format(tostring(tag), tostring(msg)), interval)
 end
 
 SafeRuntime.Logger = function(scope, msg)
     local key = tostring(scope) .. ":" .. tostring(msg):sub(1, 80)
-    debugLogThrottled("runtime_errors.txt", key, ("[%s] %s"):format(tostring(scope), tostring(msg)), 3)
+    LogDebugThrottled("runtime_errors.txt", key, ("[%s] %s"):format(tostring(scope), tostring(msg)), 3)
     if WarnAsyncThrottled then
         WarnAsyncThrottled(tostring(scope), msg)
     end
@@ -1232,10 +1291,93 @@ local function cancelTween()
 end
 Movement.CancelTween = cancelTween
 
+function Movement.ResolvePriority(label: string?): number
+    if type(label) ~= "string" or label == "" then return 30 end
+    local exact = Movement.PRIORITIES[label]
+    if exact then return exact end
+    if label:sub(1, 9) == "StoryLoop" then return Movement.PRIORITIES.StoryLoop end
+    return 30
+end
+
+function Movement.TagThread(label: string, priority: number?)
+    local co = coroutine.running()
+    if not co then return end
+    Movement.ThreadTags[co] = {
+        name = label,
+        priority = priority or Movement.ResolvePriority(label),
+    }
+end
+
+function Movement.GetCurrentTag(): (string, number)
+    local co = coroutine.running()
+    local tag = co and Movement.ThreadTags[co]
+    if tag then return tag.name, tag.priority end
+    return "Unknown", 30
+end
+
+function Movement.IsOwnerAlive(): boolean
+    local ownerCo = Movement.OwnerThread
+    if not ownerCo or coroutine.status(ownerCo) == "dead" then
+        Movement.OwnerThread = nil
+        Movement.OwnerName = nil
+        Movement.OwnerPriority = 0
+        Movement.OwnerLeaseUntil = 0
+        return false
+    end
+    if Movement.activeTween ~= nil or os.clock() < Movement.OwnerLeaseUntil then
+        return true
+    end
+    Movement.OwnerThread = nil
+    Movement.OwnerName = nil
+    Movement.OwnerPriority = 0
+    return false
+end
+
+function Movement.ReleaseMoveLock(force: boolean?)
+    if force or Movement.OwnerThread == coroutine.running() then
+        Movement.OwnerThread = nil
+        Movement.OwnerName = nil
+        Movement.OwnerPriority = 0
+        Movement.OwnerLeaseUntil = 0
+    end
+end
+
+function Movement.AcquireMoveLock(opts: any): boolean
+    local co = coroutine.running()
+    local defName, defPrio = Movement.GetCurrentTag()
+    local myName = (opts and opts.owner) or defName
+    local myPrio = (opts and opts.priority) or defPrio
+    if Movement.IsOwnerAlive() and Movement.OwnerThread ~= co then
+        if myPrio < Movement.OwnerPriority then
+            LogDebugEventThrottled("route_debug.txt", "tw_blk_" .. myName, "TWEEN_BLOCKED",
+                ("%s(p=%d) blocked by %s(p=%d)"):format(myName, myPrio, tostring(Movement.OwnerName), Movement.OwnerPriority), 3)
+            task.wait(0.15)
+            return false
+        end
+        if myPrio > Movement.OwnerPriority then
+            LogDebugEventThrottled("route_debug.txt", "tw_pre_" .. myName, "TWEEN_PREEMPT",
+                ("%s(p=%d) preempted %s(p=%d)"):format(myName, myPrio, tostring(Movement.OwnerName), Movement.OwnerPriority), 2)
+            cancelTween()
+            attackGoal = nil
+            currentTarget = nil
+        end
+    end
+    Movement.OwnerThread = co
+    Movement.OwnerName = myName
+    Movement.OwnerPriority = myPrio
+    Movement.OwnerLeaseUntil = os.clock() + 0.45
+    return true
+end
+
+SafeRuntime.OnLoopThread = function(label: string)
+    Movement.TagThread(label)
+end
+
 function Movement.TweenSegment(targetCF, abortIf, opts)
     if isDeadOrRespawning() then cancelTween(); return false end
     local _, hrp = getChar()
     if not hrp then return false end
+    if not Movement.AcquireMoveLock(opts) then return false end
     local dist = (hrp.Position - targetCF.Position).Magnitude
     if dist < 0.5 then
         hrp.CFrame = targetCF
@@ -1249,6 +1391,7 @@ function Movement.TweenSegment(targetCF, abortIf, opts)
         and Movement.activeTweenGoal and (Movement.activeTweenGoal.Position - targetCF.Position).Magnitude <= eps
     then
         while not Movement.activeTweenDone and Movement.activeTween == existingTw do
+            if Movement.OwnerThread ~= coroutine.running() then break end
             if isDeadOrRespawning() or (abortIf and abortIf()) then
                 cancelTween()
                 return false
@@ -1258,9 +1401,13 @@ function Movement.TweenSegment(targetCF, abortIf, opts)
                 if Movement.activeTween == existingTw then cancelTween() end
                 return false
             end
+            Movement.OwnerLeaseUntil = os.clock() + 0.45
             h.AssemblyLinearVelocity = Vector3.zero
             h.AssemblyAngularVelocity = Vector3.zero
             RunService.Heartbeat:Wait()
+        end
+        if Movement.OwnerThread == coroutine.running() then
+            Movement.OwnerLeaseUntil = os.clock() + 0.25
         end
         return Movement.activeTweenDone
     end
@@ -1287,12 +1434,14 @@ function Movement.TweenSegment(targetCF, abortIf, opts)
     tw:Play()
     local lastPos = hrp.Position
     while not done and Movement.activeTween == tw do
+        if Movement.OwnerThread ~= coroutine.running() then break end
         if isDeadOrRespawning() or (abortIf and abortIf()) then break end
         local _, h = getChar()
         if not h then break end
         if (h.Position - lastPos).Magnitude > math.max(350, (CFG.TweenSpeed or 250) * 0.5) then
             break
         end
+        Movement.OwnerLeaseUntil = os.clock() + 0.45
         lastPos = h.Position
         h.AssemblyLinearVelocity = Vector3.zero
         h.AssemblyAngularVelocity = Vector3.zero
@@ -1300,6 +1449,9 @@ function Movement.TweenSegment(targetCF, abortIf, opts)
     end
     if Movement.activeTween == tw then
         cancelTween()
+    end
+    if Movement.OwnerThread == coroutine.running() then
+        Movement.OwnerLeaseUntil = os.clock() + 0.25
     end
     return done
 end
@@ -1505,7 +1657,7 @@ end
 -- wrapper continua tolerante a falhas, mas deixa um diagnóstico acionável.
 function GameClient.FireServerLogged(logFile, context, ...)
     if not (GameModules and GameModules.Network and GameModules.Network.FireServer) then
-        debugLog(logFile or "network_debug.txt", ("REMOTE_FAIL context=%s error=Network indisponível"):format(tostring(context)))
+        LogDebug(logFile or "network_debug.txt", ("REMOTE_FAIL context=%s error=Network indisponível"):format(tostring(context)))
         return false, "Network indisponível"
     end
     local args = table.pack(...)
@@ -1517,7 +1669,7 @@ function GameClient.FireServerLogged(logFile, context, ...)
         GameModules.Network:FireServer(table.unpack(args, 1, args.n))
     end)
     if not ok then
-        debugLog(logFile or "network_debug.txt", ("REMOTE_FAIL context=%s error=%s"):format(tostring(context), tostring(err)))
+        LogDebug(logFile or "network_debug.txt", ("REMOTE_FAIL context=%s error=%s"):format(tostring(context), tostring(err)))
     end
     return ok, err
 end
@@ -1525,7 +1677,7 @@ end
 GameClient._RemoteEvents = {}
 GameClient._RemoteFunctions = {}
 
-function GameClient.GetRemoteEvent(name)
+function GameClient.GetRemoteEvent(name: string): RemoteEvent?
     local cached = GameClient._RemoteEvents[name]
     if cached and cached.Parent then return cached end
     local ni = ReplicatedStorage:FindFirstChild("NetworkInstances")
@@ -1535,7 +1687,7 @@ function GameClient.GetRemoteEvent(name)
     return ev
 end
 
-function GameClient.GetRemoteFunction(name)
+function GameClient.GetRemoteFunction(name: string): RemoteFunction?
     local cached = GameClient._RemoteFunctions[name]
     if cached and cached.Parent then return cached end
     local ni = ReplicatedStorage:FindFirstChild("NetworkInstances")
@@ -1545,7 +1697,7 @@ function GameClient.GetRemoteFunction(name)
     return fn
 end
 
-function GameClient.FireNet(remoteName, ...)
+function GameClient.FireNet(remoteName: string, ...: any): (boolean, string?)
     local args = table.pack(...)
     if GameModules and GameModules.Network and GameModules.Network.FireServer then
         return pcall(function()
@@ -1561,7 +1713,7 @@ function GameClient.FireNet(remoteName, ...)
     return false, "RemoteEvent unavailable: " .. tostring(remoteName)
 end
 
-function GameClient.InvokeNet(timeout, remoteName, ...)
+function GameClient.InvokeNet(timeout: number?, remoteName: string, ...: any): (boolean, any)
     local args = table.pack(...)
     if GameModules and GameModules.Network and GameModules.Network.SafeInvokeServer then
         return pcall(function()
@@ -1577,21 +1729,21 @@ function GameClient.InvokeNet(timeout, remoteName, ...)
     return false, "RemoteFunction unavailable: " .. tostring(remoteName)
 end
 
-function GameClient.Converse(npcName, ...)
+function GameClient.Converse(npcName: string, ...: any): (boolean, string?)
     if Movement and Movement.BeginInteract then
         Movement.BeginInteract(nil)
     end
     return GameClient.FireNet("Elysium_Converse", npcName, ...)
 end
 
-function GameClient.InvokeConverse(timeout, npcName, ...)
+function GameClient.InvokeConverse(timeout: number?, npcName: string, ...: any): (boolean, any)
     if Movement and Movement.BeginInteract then
         Movement.BeginInteract(nil)
     end
     return GameClient.InvokeNet(timeout or 5, "Elysium_Converse", npcName, ...)
 end
 
-function GameClient.GetNpcFrontCFrame(npcOrName, fallbackPos, distFromNpc)
+function GameClient.GetNpcFrontCFrame(npcOrName: Instance | string, fallbackPos: Vector3?, distFromNpc: number?): CFrame?
     local dist = tonumber(distFromNpc) or 3
     local kCF = nil
     if typeof(npcOrName) == "Instance" and npcOrName:IsA("Model") then
@@ -1697,7 +1849,7 @@ function GameClient.GetDialogueClient()
     return GameClient.DialogueClient
 end
 
-function GameClient.TryNativeRepeatQuest(targetQuestName)
+function GameClient.TryNativeRepeatQuest(targetQuestName: string?): boolean
     local qs = GameClient.GetQuestClient and GameClient.GetQuestClient()
     local rq = qs and qs.RepeatQuest
     if rq and rq.QuestName and (not targetQuestName or rq.QuestName == targetQuestName)
@@ -2487,17 +2639,28 @@ function Features.InitCombatCore()
     local function farmLoop()
         State.farmToken += 1
         local my = State.farmToken
-        debugLog("farm_debug.txt", ("=== AutoFarm START lv=%d AutoQuest=%s ==="):format(getLevel(), tostring(CFG.AutoQuest)), true)
+        LogDebug("farm_debug.txt", ("=== AutoFarm START lv=%d AutoQuest=%s ==="):format(getLevel(), tostring(CFG.AutoQuest)), true)
         task.spawn(function()
             local function aborted() return not CFG.AutoFarm or State.farmToken ~= my end
             local lastFarmLog, lastNoTargetT = "", 0
             local function logFarm(msg)
                 if msg == lastFarmLog and (os.clock() - lastNoTargetT) < 5 then return end
                 lastFarmLog, lastNoTargetT = msg, os.clock()
-                debugLog("farm_debug.txt", msg)
+                LogDebug("farm_debug.txt", msg)
             end
             SafeRuntime.RunResilientLoop("FarmLoop", function() return not aborted() end, function()
             while not aborted() do
+                if isDeadOrRespawning() or collecting or State.bossBusy or State.islandBossBusy or State.seaBeastBusy or State.fortRaidBusy or CFG.AutoDungeon then
+                    attackGoal = nil
+                    currentTarget = nil
+                    if isDeadOrRespawning() then Status = "Aguardando respawn..." end
+                    logFarm(("PAUSED dead=%s collect=%s boss=%s iboss=%s sb=%s fort=%s dung=%s"):format(
+                        tostring(isDeadOrRespawning()), tostring(collecting), tostring(State.bossBusy),
+                        tostring(State.islandBossBusy), tostring(State.seaBeastBusy), tostring(State.fortRaidBusy), tostring(CFG.AutoDungeon)
+                    ))
+                    task.wait(0.4)
+                    continue
+                end
                 local continue_ = false
                 local char, hrp, hum = getChar()
                 if not char then
@@ -2595,7 +2758,7 @@ function Features.InitCombatCore()
                 end
             end
             end, function(err) attackGoal = nil; currentTarget = nil; cancelTween() end)
-            debugLog("farm_debug.txt", "=== AutoFarm STOP ===")
+            LogDebug("farm_debug.txt", "=== AutoFarm STOP ===")
             attackGoal = nil
             cancelTween()
             Status = "Parado"
@@ -2721,7 +2884,7 @@ function Features.InitCombatCore()
             Combat.hitboxModule = hb
             Combat.origBoxModifier = hb.BoxModifier
             local lastHbLog = 0
-            debugLog("hitbox_debug.txt", "HOOK_OK SetBoxModifier", true)
+            LogDebug("hitbox_debug.txt", "HOOK_OK SetBoxModifier", true)
             Combat.boxModifierFn = function(c, cf, size)
                 if Combat.origBoxModifier then
                     cf, size = Combat.origBoxModifier(c, cf, size)
@@ -2734,7 +2897,7 @@ function Features.InitCombatCore()
                         local now = os.clock()
                         if now - lastHbLog >= 2 then
                             lastHbLog = now
-                            debugLog("hitbox_debug.txt", ("HITBOX_APPLIED target=%s size=%d dist=%.1f"):format(currentTarget.Name, s, (r.Position - trp.Position).Magnitude))
+                            LogDebug("hitbox_debug.txt", ("HITBOX_APPLIED target=%s size=%d dist=%.1f"):format(currentTarget.Name, s, (r.Position - trp.Position).Magnitude))
                         end
                         return CFrame.new(trp.Position), Vector3.new(s, s, s)
                     end
@@ -3234,6 +3397,7 @@ function GameClient.EnsureFruitCollectLoop()
                             local p = fruitPart(f)
                             if p then
                                 Status = "Coletando: " .. f.Name
+                                LogDebugEvent("fruit_debug.txt", "COLLECT", ("name=%s pos=(%.0f,%.0f,%.0f)"):format(tostring(f.Name), p.Position.X, p.Position.Y, p.Position.Z))
                                 if not Features.PauseForInterrupt then
                                     State.farmToken += 1
                                     attackGoal = nil
@@ -3626,8 +3790,8 @@ function GameClient.EnsureKillAuraLoop()
     State.Tokens.KillAura += 1
     local myTok = State.Tokens.KillAura
     State.KillAuraRunning = true
-    debugLog("killaura_debug.txt", "=== KillAura Debug START ===", true)
-    local function logKA(msg) debugLog("killaura_debug.txt", msg) end
+    LogDebug("killaura_debug.txt", "=== KillAura Debug START ===", true)
+    local function logKA(msg) LogDebug("killaura_debug.txt", msg) end
     task.spawn(function()
         SafeRuntime.RunResilientLoop("KillAura", function() return CFG.AttackMode == "KillAura" and attackGoal ~= nil and State.Tokens.KillAura == myTok end, function()
         while CFG.AttackMode == "KillAura" and attackGoal ~= nil and State.Tokens.KillAura == myTok do
@@ -3723,7 +3887,7 @@ function GameClient.EnsureKillAuraLoop()
                                 end
                                 if sbDistLog then
                                     local hpNow = mobHP(currentTarget)
-                                    debugLog("seabeast_debug.txt", ("KA_FIRE d=%.1f hp=%.0f combo=%d tool=%s"):format(sbDistLog, hpNow, Combat.auraCombo, tostring(equipped.Name)))
+                                    LogDebug("seabeast_debug.txt", ("KA_FIRE d=%.1f hp=%.0f combo=%d tool=%s"):format(sbDistLog, hpNow, Combat.auraCombo, tostring(equipped.Name)))
                                 end
                                 table.clear(candidates)
                                 table.clear(hits)
@@ -3769,7 +3933,7 @@ pcall(function()
 end)
 
 local function logSkill(msg)
-    debugLog("skill_debug.txt", msg)
+    LogDebug("skill_debug.txt", msg)
 end
 
 local function isSkillReady(toolName, keyStr, isEquipped)
@@ -4378,6 +4542,7 @@ do
             return not CFG.AutoFish or State.Tokens.Fish ~= myTok
         end
         task.spawn(function()
+            LogDebugEvent("fishing_debug.txt", "START", ("spot=%s sell=%s"):format(tostring(CFG.FishSpot), tostring(CFG.AutoSellFish)), true)
             SafeRuntime.RunResilientLoop("AutoFish", function() return CFG.AutoFish and State.Tokens.Fish == myTok end, function()
             while CFG.AutoFish and State.Tokens.Fish == myTok do
                 if not CFG.AutoFarm and not collecting then
@@ -5538,6 +5703,7 @@ local function fightingStyleLoop()
     startMinigameSolver(aborted)
 
     task.spawn(function()
+        LogDebugEvent("fighting_style_debug.txt", "START", ("dark=%s water=%s electric=%s"):format(tostring(CFG.AutoDarkStep), tostring(CFG.AutoWaterKungFu), tostring(CFG.AutoEletric)), true)
         local styles = {
             { cfg = "AutoDarkStep",    name = "Dark Step",     fn = unlockDarkStep },
             { cfg = "AutoWaterKungFu", name = "Water Kung-Fu", fn = unlockWaterKungFu },
@@ -5841,7 +6007,7 @@ function GameClient.NextAvailableVoxQuest(skipped)
     local questOrder = GameClient.VoxQuestOrder[CFG.VoxTrainingType]
     if not questOrder then return nil end
     local voxDebugFile = CFG.VoxTrainingType == "Armor" and "vox_armor_debug.txt" or "vox_sense_debug.txt"
-    debugLog(voxDebugFile, ("STATE type=%s level=%s sense=%s armor=%s gold=%s"):format(
+    LogDebug(voxDebugFile, ("STATE type=%s level=%s sense=%s armor=%s gold=%s"):format(
         tostring(CFG.VoxTrainingType), tostring(level), tostring(abilityLevels.Kenbushoku),
         tostring(abilityLevels.Busoshoku), tostring(gold)
     ))
@@ -5866,7 +6032,7 @@ function GameClient.NextAvailableVoxQuest(skipped)
                 end
                 local canTake = true
                 pcall(function() canTake = MainModules.QuestsUtils.CanTake(LP, qName) ~= false end)
-                debugLog(voxDebugFile, ("CANDIDATE quest=%s completed=%s canTake=%s minLevel=%s"):format(
+                LogDebug(voxDebugFile, ("CANDIDATE quest=%s completed=%s canTake=%s minLevel=%s"):format(
                     tostring(qName), tostring(completed), tostring(canTake), tostring(info.MinLevel)
                 ))
                 if not completed and canTake then return qName, info end
@@ -6430,7 +6596,7 @@ function GameClient.ResolveWithInteriorRoutes(targetPos, objectiveId)
     local routedName = typeof(routed) == "Instance" and routed.Name or ""
     local isDoor = routedName ~= "" and (routedName ~= "VM_AutoTarget" or routedName:sub(1, 5) == "Door_")
     if isDoor then
-        debugLog("route_debug.txt", ("MODULE_ROUTE oid=%s via=%s target=%s"):format(
+        LogDebug("route_debug.txt", ("MODULE_ROUTE oid=%s via=%s target=%s"):format(
             tostring(objectiveId), tostring(routedName), tostring(targetPos)
         ))
         return routedPos, true
@@ -6833,7 +6999,7 @@ local function logMirrorThrottled(key, msg)
     local now = os.clock()
     if key == lastMirrorSkipKey and (now - lastMirrorSkipAt) < 5 then return end
     lastMirrorSkipKey, lastMirrorSkipAt = key, now
-    debugLog("mirror_debug.txt", msg)
+    LogDebug("mirror_debug.txt", msg)
 end
 
 Movement.TryMirrorKeeperTravel = function(destPos, targetIslandName, abortIf)
@@ -6907,16 +7073,16 @@ Movement.TryMirrorKeeperTravel = function(destPos, targetIslandName, abortIf)
         return false
     end
 
-    debugLog("mirror_debug.txt", ("TRY: keeper=%s (d=%.0f) -> %s (price=%d gold=%d)"):format(keeperName, keeperDist, targetArea.Name, price, gold))
+    LogDebug("mirror_debug.txt", ("TRY: keeper=%s (d=%.0f) -> %s (price=%d gold=%d)"):format(keeperName, keeperDist, targetArea.Name, price, gold))
     Status = ("Mirror Keeper: indo até %s (-%d Gold)..."):format(targetArea.Name, price)
     local maxKeeperRange = ((MainModules and MainModules.TravelUtils and tonumber(MainModules.TravelUtils.KeeperRange)) or 25) - 3
     if keeperDist > 6 then
         task.spawn(function() pcall(function() LP:RequestStreamAroundAsync(kPos) end) end)
         local tTw = os.clock()
         tweenTo(GameClient.GetNpcFrontCFrame(keeperName, kPos, 3), abortIf)
-        debugLog("mirror_debug.txt", ("TWEEN_KEEPER done in %.1fs"):format(os.clock() - tTw))
+        LogDebug("mirror_debug.txt", ("TWEEN_KEEPER done in %.1fs"):format(os.clock() - tTw))
         if isDeadOrRespawning() or (abortIf and abortIf()) then
-            debugLog("mirror_debug.txt", ("ABORT: %s durante tween até keeper %s"):format(isDeadOrRespawning() and "morreu" or "abortado", keeperName))
+            LogDebug("mirror_debug.txt", ("ABORT: %s durante tween até keeper %s"):format(isDeadOrRespawning() and "morreu" or "abortado", keeperName))
             return false
         end
         task.wait(0.05)
@@ -6924,21 +7090,21 @@ Movement.TryMirrorKeeperTravel = function(destPos, targetIslandName, abortIf)
 
     local _, hrpNow = getChar()
     if isDeadOrRespawning() or not hrpNow then
-        debugLog("mirror_debug.txt", ("ABORT: morreu/sem HRP antes de falar com keeper %s"):format(keeperName))
+        LogDebug("mirror_debug.txt", ("ABORT: morreu/sem HRP antes de falar com keeper %s"):format(keeperName))
         return false
     end
     local distToKeeper = (hrpNow.Position - kPos).Magnitude
     if distToKeeper > 8 and distToKeeper <= 80 then
         tweenTo(GameClient.GetNpcFrontCFrame(keeperName, kPos, 2), abortIf)
         if isDeadOrRespawning() or (abortIf and abortIf()) then
-            debugLog("mirror_debug.txt", ("ABORT: %s no ajuste fino até keeper %s"):format(isDeadOrRespawning() and "morreu" or "abortado", keeperName))
+            LogDebug("mirror_debug.txt", ("ABORT: %s no ajuste fino até keeper %s"):format(isDeadOrRespawning() and "morreu" or "abortado", keeperName))
             return false
         end
         _, hrpNow = getChar()
         distToKeeper = hrpNow and (hrpNow.Position - kPos).Magnitude or math.huge
     end
     if not hrpNow or distToKeeper > maxKeeperRange then
-        debugLog("mirror_debug.txt", ("ABORT: longe do keeper %s após tween (d=%.0f > %.0f)"):format(keeperName, distToKeeper, maxKeeperRange))
+        LogDebug("mirror_debug.txt", ("ABORT: longe do keeper %s após tween (d=%.0f > %.0f)"):format(keeperName, distToKeeper, maxKeeperRange))
         return false
     end
 
@@ -6956,37 +7122,37 @@ Movement.TryMirrorKeeperTravel = function(destPos, targetIslandName, abortIf)
                 cancelTween()
                 if isDeadOrRespawning() or (abortIf and abortIf()) then return false end
             end
-            debugLog("mirror_debug.txt", ("RETRY: reenviando Travel para %s via %s"):format(targetArea.Name, keeperName))
+            LogDebug("mirror_debug.txt", ("RETRY: reenviando Travel para %s via %s"):format(targetArea.Name, keeperName))
         end
-        debugLog("mirror_debug.txt", ("ATTEMPT_%d: send Travel"):format(attempt))
+        LogDebug("mirror_debug.txt", ("ATTEMPT_%d: send Travel"):format(attempt))
         local dlg = GameClient.GetDialogueClient and GameClient.GetDialogueClient()
         if dlg and type(dlg.GetBlockReason) == "function" then
             local okBlk, blkReason = pcall(dlg.GetBlockReason, "Mirror Keeper")
             if okBlk and blkReason then
-                debugLog("mirror_debug.txt", ("DIALOGUE_BLOCKED reason=%s"):format(tostring(blkReason)))
+                LogDebug("mirror_debug.txt", ("DIALOGUE_BLOCKED reason=%s"):format(tostring(blkReason)))
             end
         end
         local okTravel, errTravel = GameClient.Converse("Mirror Keeper", "Travel", targetArea.Name)
         if okTravel then
-            debugLog("mirror_debug.txt", ("ATTEMPT_%d: Travel sent -> %s"):format(attempt, tostring(targetArea.Name)))
+            LogDebug("mirror_debug.txt", ("ATTEMPT_%d: Travel sent -> %s"):format(attempt, tostring(targetArea.Name)))
         else
-            debugLog("mirror_debug.txt", ("ATTEMPT_%d: Travel failed -> %s (%s)"):format(attempt, tostring(targetArea.Name), tostring(errTravel)))
+            LogDebug("mirror_debug.txt", ("ATTEMPT_%d: Travel failed -> %s (%s)"):format(attempt, tostring(targetArea.Name), tostring(errTravel)))
         end
 
         local tWait = os.clock() + (attempt == 1 and 2.0 or 2.5)
         while os.clock() < tWait do
             if isDeadOrRespawning() then
-                debugLog("mirror_debug.txt", ("ABORT: morreu aguardando TP para %s"):format(targetArea.Name))
+                LogDebug("mirror_debug.txt", ("ABORT: morreu aguardando TP para %s"):format(targetArea.Name))
                 return false
             end
             if abortIf and abortIf() then
-                debugLog("mirror_debug.txt", ("ABORT: aguardando TP para %s"):format(targetArea.Name))
+                LogDebug("mirror_debug.txt", ("ABORT: aguardando TP para %s"):format(targetArea.Name))
                 return false
             end
             local _, hNow = getChar()
             if hNow and (hNow.Position - beforePos).Magnitude > 1500 then
                 cancelTween()
-                debugLog("mirror_debug.txt", ("SUCCESS: teleportou para %s (delta=%.0f)"):format(targetArea.Name, (hNow.Position - beforePos).Magnitude))
+                LogDebug("mirror_debug.txt", ("SUCCESS: teleportou para %s (delta=%.0f)"):format(targetArea.Name, (hNow.Position - beforePos).Magnitude))
                 Status = ("Mirror Keeper: chegou em %s (aguardando carregamento)..."):format(targetArea.Name)
                 if not Movement.WaitPostTeleport(Movement.POST_TELEPORT_WAIT, abortIf, ("Mirror Keeper: chegou em %s (aguardando 3s)..."):format(targetArea.Name)) then
                     return false
@@ -6996,7 +7162,7 @@ Movement.TryMirrorKeeperTravel = function(destPos, targetIslandName, abortIf)
             task.wait(0.15)
         end
     end
-    debugLog("mirror_debug.txt", ("TIMEOUT: servidor não teleportou para %s via %s"):format(targetArea.Name, keeperName))
+    LogDebug("mirror_debug.txt", ("TIMEOUT: servidor não teleportou para %s via %s"):format(targetArea.Name, keeperName))
     return false
 end
 
@@ -7520,7 +7686,7 @@ function GameClient.DebugQuestSnapshot(fileName, mode)
         local _, hrp, hum = getChar()
         local abilities = data and data.Abilitys or {}
         local gold = data and data.Monetization and data.Monetization.Gold
-        debugLog(fileName, ("SNAPSHOT mode=%s level=%s gold=%s hp=%s pos=%s location=%s sense=%s armor=%s"):format(
+        LogDebug(fileName, ("SNAPSHOT mode=%s level=%s gold=%s hp=%s pos=%s location=%s sense=%s armor=%s"):format(
             tostring(mode), tostring(getLevel()), tostring(gold), tostring(hum and hum.Health),
             tostring(hrp and hrp.Position), tostring(LP:GetAttribute("CurrentLocation")),
             tostring(abilities.Kenbushoku), tostring(abilities.Busoshoku)
@@ -7531,7 +7697,7 @@ function GameClient.DebugQuestSnapshot(fileName, mode)
             table.insert(activeNames, tostring(questName))
         end
         table.sort(activeNames)
-        debugLog(fileName, "ACTIVE_QUESTS count=" .. tostring(#activeNames) .. " names=[" .. table.concat(activeNames, " | ") .. "]")
+        LogDebug(fileName, "ACTIVE_QUESTS count=" .. tostring(#activeNames) .. " names=[" .. table.concat(activeNames, " | ") .. "]")
 
         local progress = GameClient.getQuestClientProgress()
         local objectiveRows = {}
@@ -7541,7 +7707,7 @@ function GameClient.DebugQuestSnapshot(fileName, mode)
             end
         end
         table.sort(objectiveRows)
-        debugLog(fileName, "ACTIVE_OBJECTIVES count=" .. tostring(#objectiveRows) .. " values=[" .. table.concat(objectiveRows, " | ") .. "]")
+        LogDebug(fileName, "ACTIVE_OBJECTIVES count=" .. tostring(#objectiveRows) .. " values=[" .. table.concat(objectiveRows, " | ") .. "]")
 
         if mode == "Secondary" then
             local completed, available = 0, 0
@@ -7552,7 +7718,7 @@ function GameClient.DebugQuestSnapshot(fileName, mode)
                 local info = getQuestInfo(questName)
                 if info and getLevel() >= (info.MinLevel or 0) then available += 1 end
             end
-            debugLog(fileName, ("SECONDARY_QUEST_SUMMARY configured=%d completed=%d levelEligible=%d"):format(
+            LogDebug(fileName, ("SECONDARY_QUEST_SUMMARY configured=%d completed=%d levelEligible=%d"):format(
                 #GameClient.SECONDARY_QUEST_ORDER, completed, available
             ))
         end
@@ -7595,7 +7761,7 @@ local function storyLoop(mode)
         local storyLogFile = isVox and (CFG.VoxTrainingType == "Armor" and "vox_armor_debug.txt" or "vox_sense_debug.txt")
             or (isSec and "secondary_quests_debug.txt" or "history_debug.txt")
         local function logSec(msg)
-            debugLog(storyLogFile, msg)
+            LogDebug(storyLogFile, msg)
         end
         local function exitInteriorIfInside()
             local _, hChk = getChar()
@@ -7694,7 +7860,7 @@ local function storyLoop(mode)
                 end
             end
         end
-        debugLog(storyLogFile, ("=== LOOP START mode=%s voxType=%s level=%s ==="):format(
+        LogDebug(storyLogFile, ("=== LOOP START mode=%s voxType=%s level=%s ==="):format(
             tostring(mode), tostring(CFG.VoxTrainingType), tostring(getLevel())
         ), true)
         GameClient.DebugQuestSnapshot(storyLogFile, mode)
@@ -9493,7 +9659,7 @@ local function storyLoop(mode)
                         elseif oid:sub(1, 17) == "Break_FrozenFish_" then
                             Status = ("Secundárias: quebrando gelo (%s)..."):format(oid:match("%d+$") or "?")
                             local function logIce(msg)
-                                debugLog("frozen_catch_debug.txt", ("%s | %s"):format(tostring(oid), tostring(msg)))
+                                LogDebug("frozen_catch_debug.txt", ("%s | %s"):format(tostring(oid), tostring(msg)))
                             end
                             local _, hIce = getChar()
                             if pos and hIce then
@@ -10052,10 +10218,10 @@ end
 -- Auto Boss
 
 function GameClient.PauseMainModesForBoss()
-    if CFG.AutoCollectibles then debugLog("collectibles_debug.txt", "STOP reason=boss_interrupt") end
-    if CFG.AutoSecretAchievements then debugLog("secret_debug.txt", "STOP reason=boss_interrupt") end
+    if CFG.AutoCollectibles then LogDebug("collectibles_debug.txt", "STOP reason=boss_interrupt") end
+    if CFG.AutoSecretAchievements then LogDebug("secret_debug.txt", "STOP reason=boss_interrupt") end
     if CFG.AutoVoxTraining then
-        debugLog(CFG.VoxTrainingType == "Armor" and "vox_armor_debug.txt" or "vox_sense_debug.txt", "STOP reason=boss_interrupt")
+        LogDebug(CFG.VoxTrainingType == "Armor" and "vox_armor_debug.txt" or "vox_sense_debug.txt", "STOP reason=boss_interrupt")
     end
     CFG.AutoFarm = false
     State.farmToken += 1
@@ -10070,6 +10236,16 @@ function GameClient.PauseMainModesForBoss()
     GameClient.CollectibleToken = (GameClient.CollectibleToken or 0) + 1
     State.storyToken += 1
     GameClient.stopFightingStyle()
+    CFG.AutoMobDrops = false
+    State.Tokens.MobDrop = (State.Tokens.MobDrop or 0) + 1
+    CFG.AutoBlacksmith = false
+    State.Tokens.Blacksmith = (State.Tokens.Blacksmith or 0) + 1
+    CFG.AutoCraftRaidKey = false
+    State.Tokens.KeyCraft = (State.Tokens.KeyCraft or 0) + 1
+    CFG.AutoForgeUpgrade = false
+    State.Tokens.ForgeUpgrade = (State.Tokens.ForgeUpgrade or 0) + 1
+    CFG.AutoFish = false
+    State.Tokens.Fish = (State.Tokens.Fish or 0) + 1
     attackGoal = nil
     currentTarget = nil
     cancelTween()
@@ -10199,9 +10375,9 @@ function GameClient.BossLoop()
     State.bossToken += 1
     local my = State.bossToken
     task.spawn(function()
-        debugLog("boss_debug.txt", ("=== AutoBoss START lv=%d ==="):format(getLevel()), true)
+        LogDebug("boss_debug.txt", ("=== AutoBoss START lv=%d ==="):format(getLevel()), true)
         local lastLogT, lastLogMsg = 0, ""
-        local function logBoss(msg) debugLog("boss_debug.txt", msg) end
+        local function logBoss(msg) LogDebug("boss_debug.txt", msg) end
         local function logBossThrottled(msg, interval)
             local now = os.clock()
             if msg ~= lastLogMsg or now - lastLogT >= (interval or 4) then
@@ -10551,7 +10727,7 @@ function GameClient.IslandBossLoop()
     State.islandBossToken += 1
     local my = State.islandBossToken
     task.spawn(function()
-        debugLog("boss_debug.txt", ("=== AutoIslandBoss START lv=%d ==="):format(getLevel()))
+        LogDebug("boss_debug.txt", ("=== AutoIslandBoss START lv=%d ==="):format(getLevel()))
         local idx = 1
         local cooldownUntil = {}
         local function aborted()
@@ -10570,6 +10746,7 @@ function GameClient.IslandBossLoop()
                 if State.islandBossBusy then State.islandBossBusy = false end
                 attackGoal = nil
                 currentTarget = nil
+                LogDebugEventThrottled("boss_debug.txt", "ib_pause", "ISLAND_BOSS_PAUSE", ("dead=%s sb=%s fort=%s boss=%s"):format(tostring(isDeadOrRespawning()), tostring(State.seaBeastBusy), tostring(State.fortRaidBusy), tostring(State.bossBusy)), 4)
                 task.wait(0.5)
             else
                 local selected = getSelectedIslandBosses()
@@ -10626,7 +10803,7 @@ function GameClient.IslandBossLoop()
                                 State.islandBossBusy = false
                                 if not State.seaBeastBusy and not State.fortRaidBusy and not State.bossBusy then
                                     if CFG.MainModeActive and Features.ResumeMainMode then Features.ResumeMainMode()
-                                    elseif CFG.AutoMob and Features.MobLoop then Features.MissionLoop() end
+                                    elseif CFG.AutoMob and Features.MissionLoop then Features.MissionLoop() end
                                 end
                             end
                             task.wait(1.5)
@@ -10654,7 +10831,7 @@ function GameClient.IslandBossLoop()
                                     end
                                     if not actAborted() and not findWorldBoss(chosen) then
                                         task.wait(1)
-                                        debugLog("island_boss_debug.txt", "SUMMON_VOIDWALKER Elysium_Converse('Void Herald', 'Summon')")
+                                        LogDebug("island_boss_debug.txt", "SUMMON_VOIDWALKER Elysium_Converse('Void Herald', 'Summon')")
                                         GameClient.Converse("Void Herald", "Summon")
                                     end
                                 end
@@ -10672,7 +10849,7 @@ function GameClient.IslandBossLoop()
                                     State.islandBossBusy = false
                                     if not State.seaBeastBusy and not State.fortRaidBusy and not State.bossBusy then
                                         if CFG.MainModeActive and Features.ResumeMainMode then Features.ResumeMainMode()
-                                        elseif CFG.AutoMob and Features.MobLoop then Features.MissionLoop() end
+                                        elseif CFG.AutoMob and Features.MissionLoop then Features.MissionLoop() end
                                     end
                                     task.wait(2)
                                 end
@@ -10686,11 +10863,11 @@ function GameClient.IslandBossLoop()
                             GameClient.PauseMainModesForBoss()
                         end
                         Status = ("Boss Ilha: %s"):format(bossName)
-                        debugLog("boss_debug.txt", ("ISLAND_BOSS_FIGHT %s hp=%.0f"):format(bossName, mobHP(target)))
+                        LogDebug("boss_debug.txt", ("ISLAND_BOSS_FIGHT %s hp=%.0f"):format(bossName, mobHP(target)))
                         Combat.FightTarget(target, function() return actAborted() or not mobAlive(target) end, "Boss Ilha", { checkStuck = false, allowGoNear = true })
                         if not mobAlive(target) then
                             cooldownUntil[bossName] = os.clock() + 20
-                            debugLog("boss_debug.txt", ("ISLAND_BOSS_KILLED %s"):format(bossName))
+                            LogDebug("boss_debug.txt", ("ISLAND_BOSS_KILLED %s"):format(bossName))
                         end
                         attackGoal = nil
                         currentTarget = nil
@@ -10700,7 +10877,6 @@ function GameClient.IslandBossLoop()
         end
         end, function(err) State.islandBossBusy = false; attackGoal = nil; currentTarget = nil; cancelTween() end)
         State.islandBossBusy = false
-        State.bossBusy = false
         attackGoal = nil
         currentTarget = nil
         if Movement and Movement.Stop then Movement.Stop() end
@@ -10841,7 +11017,7 @@ function GameClient.StartRaidLoop()
     GameClient.RaidToken += 1
     local token = GameClient.RaidToken
     task.spawn(function()
-        debugLog("raid_debug.txt", ("=== RAID START difficulty=%s payment=%s level=%s ==="):format(
+        LogDebug("raid_debug.txt", ("=== RAID START difficulty=%s payment=%s level=%s ==="):format(
             tostring(CFG.RaidDifficulty), tostring(CFG.RaidPayment), tostring(getLevel())
         ), true)
         local raidIndex = 1
@@ -10852,7 +11028,7 @@ function GameClient.StartRaidLoop()
             return not CFG.AutoRaid or token ~= GameClient.RaidToken
         end
         local function raidLog(msg)
-            debugLog("raid_debug.txt", msg)
+            LogDebug("raid_debug.txt", msg)
         end
         local function resolveKeeperPos(settings, bName)
             if type(bName) ~= "string" or bName == "" then return nil, nil end
@@ -11338,7 +11514,7 @@ function GameClient.StartFortRaidLoop()
     GameClient.FortRaidToken += 1
     local token = GameClient.FortRaidToken
     task.spawn(function()
-        debugLog("fort_raid_debug.txt", ("=== FORT RAID START level=%s ==="):format(tostring(getLevel())), true)
+        LogDebug("fort_raid_debug.txt", ("=== FORT RAID START level=%s ==="):format(tostring(getLevel())), true)
         local lastState, lastWave, lootedAt
         local function aborted()
             return not CFG.AutoFortRaid or token ~= GameClient.FortRaidToken
@@ -11347,7 +11523,7 @@ function GameClient.StartFortRaidLoop()
             return aborted() or State.seaBeastBusy
         end
         local function logFort(message)
-            debugLog("fort_raid_debug.txt", message)
+            LogDebug("fort_raid_debug.txt", message)
         end
         local function releaseFortPriority()
             if not State.fortRaidBusy then return end
@@ -11357,7 +11533,7 @@ function GameClient.StartFortRaidLoop()
             if not State.bossBusy and not State.seaBeastBusy then
                 if CFG.MainModeActive and Features.ResumeMainMode then
                     Features.ResumeMainMode()
-                elseif CFG.AutoMob and Features.MobLoop then
+                elseif CFG.AutoMob and Features.MissionLoop then
                     Features.MissionLoop()
                 end
             end
@@ -11598,7 +11774,7 @@ do
                 return not CFG.AutoDungeon or State.Tokens.Dungeon ~= myTok
             end
             local lastRunPoll, lastSkippedWave, lastCardWave, lastCardRoll = 0, -1, -1, -1
-            debugLog("dungeon_debug.txt", ("=== DUNGEON START inPlace=%s ==="):format(tostring(isInDungeonPlace())), true)
+            LogDebug("dungeon_debug.txt", ("=== DUNGEON START inPlace=%s ==="):format(tostring(isInDungeonPlace())), true)
             SafeRuntime.RunResilientLoop("DungeonLoop", function() return not aborted() end, function()
             while not aborted() do
                 if isInDungeonLobbyPlace() then
@@ -11618,7 +11794,7 @@ do
                                     local okS, resS = pcall(function()
                                         return GameModules.Network:SafeInvokeServer(5, "DungeonSystem", "StartLobby")
                                     end)
-                                    debugLog("dungeon_debug.txt", ("START_LOBBY ok=%s res=%s"):format(tostring(okS), tostring(resS)))
+                                    LogDebug("dungeon_debug.txt", ("START_LOBBY ok=%s res=%s"):format(tostring(okS), tostring(resS)))
                                     task.wait(resS == "Starting" and 6.0 or 2.0)
                                 else
                                     Status = "Dungeon: aguardando jogadores/combate..."
@@ -11664,7 +11840,7 @@ do
                             or run.Phase == "Finished"
                             or (not meAlive and not anyOtherAlive and run.Phase ~= "Waiting") then
                             Status = "Dungeon: saindo da partida..."
-                            debugLog("dungeon_debug.txt", ("LEAVE_RUN phase=%s wave=%s meAlive=%s"):format(tostring(run.Phase), tostring(run.Wave), tostring(meAlive)))
+                            LogDebug("dungeon_debug.txt", ("LEAVE_RUN phase=%s wave=%s meAlive=%s"):format(tostring(run.Phase), tostring(run.Wave), tostring(meAlive)))
                             task.wait(2.0)
                             if not aborted() then
                                 pcall(function() GameModules.Network:SafeInvokeServer(5, "DungeonSystem", "LeaveRun") end)
@@ -11690,7 +11866,7 @@ do
                                 local bestIdx = pickBestDungeonCard(cards.Offers, run)
                                 local chosen = cards.Offers[bestIdx]
                                 Status = ("Dungeon: escolhendo carta (%s)..."):format(tostring(chosen and (chosen.Name or chosen.Id) or bestIdx))
-                                debugLog("dungeon_debug.txt", ("SELECT_CARD wave=%s idx=%d id=%s"):format(tostring(cards.Wave), bestIdx, tostring(chosen and chosen.Id)))
+                                LogDebug("dungeon_debug.txt", ("SELECT_CARD wave=%s idx=%d id=%s"):format(tostring(cards.Wave), bestIdx, tostring(chosen and chosen.Id)))
                                 pcall(function() GameModules.Network:SafeInvokeServer(5, "DungeonSystem", "SelectCard", bestIdx) end)
                                 pcall(function()
                                     local dc = require(ReplicatedStorage.Modules.Modes.DungeonSystem["DungeonSystem Client"].InfiniteDungeon.Cards)
@@ -11724,7 +11900,7 @@ do
             if State.Tokens.Dungeon == myTok and not CFG.AutoDungeon then
                 Status = "Parado"
             end
-            debugLog("dungeon_debug.txt", "=== DUNGEON STOP ===")
+            LogDebug("dungeon_debug.txt", "=== DUNGEON STOP ===")
         end)
     end
 end
@@ -12005,7 +12181,7 @@ function GameClient.AutoDeleteMaterialStep()
         local targeted = CFG.InventoryDeleteTargets and CFG.InventoryDeleteTargets[row.Category] and CFG.InventoryDeleteTargets[row.Category][row.Name]
         if targeted and not row.Locked and before > keep then
             local amount = math.min(row.Quantity, before - keep)
-            debugLog("inventory_delete_debug.txt", ("AUTO_DELETE_REQUEST name=%s cat=%s index=%d amount=%d keep=%d before=%d"):format(
+            LogDebug("inventory_delete_debug.txt", ("AUTO_DELETE_REQUEST name=%s cat=%s index=%d amount=%d keep=%d before=%d"):format(
                 row.Name, row.Category, row.Index, amount, keep, before
             ))
             GameModules.Network:FireServer("ToolsData", "Delete", false, row.Index, row.Name, amount)
@@ -12015,10 +12191,10 @@ function GameClient.AutoDeleteMaterialStep()
                 after = GameClient.BankAmount("Unequiped", row.Name)
             until after <= before - amount or os.clock() >= deadline
             if after <= before - amount then
-                debugLog("inventory_delete_debug.txt", ("AUTO_DELETE_CONFIRMED name=%s amount=%d after=%d"):format(row.Name, amount, after))
+                LogDebug("inventory_delete_debug.txt", ("AUTO_DELETE_CONFIRMED name=%s amount=%d after=%d"):format(row.Name, amount, after))
                 Status = ("Auto excluir: %d × %s"):format(amount, row.Name)
             else
-                debugLog("inventory_delete_debug.txt", ("AUTO_DELETE_REJECTED name=%s amount=%d before=%d after=%d"):format(row.Name, amount, before, after))
+                LogDebug("inventory_delete_debug.txt", ("AUTO_DELETE_REJECTED name=%s amount=%d before=%d after=%d"):format(row.Name, amount, before, after))
             end
             return true
         end
@@ -12056,20 +12232,20 @@ function GameClient.AutoBankMaterialBatch()
     local gold = data and data.Monetization and tonumber(data.Monetization.Gold) or 0
     if fee > math.max(0, tonumber(CFG.BankMaxFee) or 0) or fee > gold then
         Status = ("Auto Banco: taxa %d Gold bloqueada"):format(fee)
-        debugLog("bank_debug.txt", ("AUTO_BANK_BLOCKED fee=%d max=%s gold=%d"):format(fee, tostring(CFG.BankMaxFee), gold))
+        LogDebug("bank_debug.txt", ("AUTO_BANK_BLOCKED fee=%d max=%s gold=%d"):format(fee, tostring(CFG.BankMaxFee), gold))
         return false
     end
 
     local previousModes = Features.PauseForInterrupt and Features.PauseForInterrupt() or nil
     local active = true
     local function aborted() return not active or not CFG.AutoBankMaterials end
-    local function logBank(message) debugLog("bank_debug.txt", message) end
+    local function logBank(message) LogDebug("bank_debug.txt", message) end
     Status = ("Auto Banco: guardando %d pilha(s)..."):format(#candidates)
     local deposited = GameClient.TransferBankBatch("Deposit", candidates, aborted, logBank)
     GameClient.CloseBank()
     active = false
     if previousModes and Features.ResumeAfterInterrupt then Features.ResumeAfterInterrupt(previousModes) end
-    debugLog("bank_debug.txt", ("AUTO_BANK_DONE stacks=%d"):format(deposited))
+    LogDebug("bank_debug.txt", ("AUTO_BANK_DONE stacks=%d"):format(deposited))
     if deposited > 0 then Status = ("Auto Banco: %d pilha(s) guardada(s)"):format(deposited) end
     return deposited > 0
 end
@@ -12118,7 +12294,7 @@ end
 
 do
 local function logSB(msg)
-    debugLog("seabeast_debug.txt", msg)
+    LogDebug("seabeast_debug.txt", msg)
 end
 
 local function sbAlive(m)
@@ -12300,10 +12476,10 @@ Features.SeaBeastLoop = function()
                         State.seaBeastActiveSkills = State.seaBeastActiveSkills or {}
                         if action == "Begin" then
                             State.seaBeastActiveSkills[key] = os.clock() + 3.0
-                            debugLog("seabeast_debug.txt", ("DODGE_START key=%s"):format(key))
+                            LogDebug("seabeast_debug.txt", ("DODGE_START key=%s"):format(key))
                         elseif action == "End" or action == "Cancel" then
                             State.seaBeastActiveSkills[key] = nil
-                            debugLog("seabeast_debug.txt", ("DODGE_END key=%s"):format(key))
+                            LogDebug("seabeast_debug.txt", ("DODGE_END key=%s"):format(key))
                         end
                     end
                 end))
@@ -12315,13 +12491,13 @@ Features.SeaBeastLoop = function()
                     if typeof(model) == "Instance" and model:IsA("Model") then
                         State.seaBeastActiveSkills = State.seaBeastActiveSkills or {}
                         State.seaBeastActiveSkills["Sea Beast:LeapGrab"] = os.clock() + 3.0
-                        debugLog("seabeast_debug.txt", "DODGE_START key=SeaBeastLeap")
+                        LogDebug("seabeast_debug.txt", "DODGE_START key=SeaBeastLeap")
                     end
                 end))
             end
         end)
     end
-    debugLog("seabeast_debug.txt", ("=== AutoSeaBeast START lv=%d ==="):format(getLevel()), true)
+    LogDebug("seabeast_debug.txt", ("=== AutoSeaBeast START lv=%d ==="):format(getLevel()), true)
     local lastLogT, lastLogMsg = 0, ""
     local function logSBThrottled(msg, interval)
         local now = os.clock()
@@ -12353,7 +12529,7 @@ Features.SeaBeastLoop = function()
                         if not State.fortRaidBusy and not State.bossBusy then
                             if CFG.MainModeActive and Features.ResumeMainMode then
                                 Features.ResumeMainMode()
-                            elseif CFG.AutoMob and Features.MobLoop then
+                            elseif CFG.AutoMob and Features.MissionLoop then
                                 Features.MissionLoop()
                             else
                                 Status = "Parado"
@@ -12430,8 +12606,10 @@ GameClient.TravelUtils = MainModules and MainModules.TravelUtils
 GameClient.ToolsInfo = MainModules and MainModules.ToolsInfo
 GameClient.TravelToPos = goNear
 GameClient.CancelTravel = cancelTween
+GameClient.TagMoveThread = Movement.TagThread
+GameClient.ReleaseMoveLock = Movement.ReleaseMoveLock
 GameClient.LogTravel = function(msg, reset)
-    debugLog("travel_debug.txt", msg, reset)
+    LogDebug("travel_debug.txt", msg, reset)
 end
 
 local function getAreasFolder()
@@ -12622,25 +12800,25 @@ function GameClient.GetNPCPosition(name)
 end
 
 function GameClient.TravelTo(kind, target, aborted)
-    debugLog("travel_debug.txt", ("=== TRAVEL START kind=%s target=%s lv=%d ==="):format(tostring(kind), tostring(target), getLevel()), true)
+    LogDebug("travel_debug.txt", ("=== TRAVEL START kind=%s target=%s lv=%d ==="):format(tostring(kind), tostring(target), getLevel()), true)
     if isDeadOrRespawning() then
-        debugLog("travel_debug.txt", "ABORT_DEAD_OR_NO_CHAR reason=dead_or_respawning")
+        LogDebug("travel_debug.txt", "ABORT_DEAD_OR_NO_CHAR reason=dead_or_respawning")
         return false
     end
     local char, hrp = getChar()
     if not (char and hrp) then
-        debugLog("travel_debug.txt", "ABORT_DEAD_OR_NO_CHAR reason=no_char")
+        LogDebug("travel_debug.txt", "ABORT_DEAD_OR_NO_CHAR reason=no_char")
         return false
     end
 
     local pos = (kind == "Island") and GameClient.GetIslandPosition(target) or GameClient.GetNPCPosition(target)
     if typeof(pos) ~= "Vector3" then
-        debugLog("travel_debug.txt", ("FAIL_NO_POS kind=%s target=%s"):format(tostring(kind), tostring(target)))
+        LogDebug("travel_debug.txt", ("FAIL_NO_POS kind=%s target=%s"):format(tostring(kind), tostring(target)))
         return false
     end
 
     local startPos = hrp.Position
-    debugLog("travel_debug.txt", ("RESOLVED from=(%.1f,%.1f,%.1f) to=(%.1f,%.1f,%.1f) dist=%.1f"):format(
+    LogDebug("travel_debug.txt", ("RESOLVED from=(%.1f,%.1f,%.1f) to=(%.1f,%.1f,%.1f) dist=%.1f"):format(
         startPos.X, startPos.Y, startPos.Z, pos.X, pos.Y, pos.Z, (startPos - pos).Magnitude
     ))
 
@@ -12651,29 +12829,29 @@ function GameClient.TravelTo(kind, target, aborted)
     if kind == "Island" then
         local usedMirror = false
         if hrp.Position.Y > -200 and Movement.TryMirrorKeeperTravel then
-            debugLog("travel_debug.txt", ("TRY_MIRROR island=%s"):format(tostring(target)))
+            LogDebug("travel_debug.txt", ("TRY_MIRROR island=%s"):format(tostring(target)))
             usedMirror = Movement.TryMirrorKeeperTravel(pos, target, aborted) == true
-            debugLog("travel_debug.txt", ("MIRROR_RESULT used=%s"):format(tostring(usedMirror)))
+            LogDebug("travel_debug.txt", ("MIRROR_RESULT used=%s"):format(tostring(usedMirror)))
         end
         if aborted and aborted() then
-            debugLog("travel_debug.txt", ("ABORTED_AFTER_MIRROR elapsed=%.2fs"):format(os.clock() - t0))
+            LogDebug("travel_debug.txt", ("ABORTED_AFTER_MIRROR elapsed=%.2fs"):format(os.clock() - t0))
             return false
         end
         if usedMirror then
             via = "MirrorKeeper"
             ok = true
         else
-            debugLog("travel_debug.txt", ("FALLBACK_GONEAR island=%s"):format(tostring(target)))
+            LogDebug("travel_debug.txt", ("FALLBACK_GONEAR island=%s"):format(tostring(target)))
             ok = goNear(pos, aborted, { noMirror = (hrp.Position.Y > -200) }) == true
         end
     else
-        debugLog("travel_debug.txt", ("START_GONEAR target=%s"):format(tostring(target)))
+        LogDebug("travel_debug.txt", ("START_GONEAR target=%s"):format(tostring(target)))
         ok = goNear(pos, aborted) == true
         if not (aborted and aborted()) then
             local pos2 = GameClient.GetNPCPosition(target)
             local _, hrpNow = getChar()
             if typeof(pos2) == "Vector3" and hrpNow and (hrpNow.Position - pos2).Magnitude > 8 then
-                debugLog("travel_debug.txt", ("REFINE_NPC_POS pos2=(%.1f,%.1f,%.1f) dist=%.1f"):format(
+                LogDebug("travel_debug.txt", ("REFINE_NPC_POS pos2=(%.1f,%.1f,%.1f) dist=%.1f"):format(
                     pos2.X, pos2.Y, pos2.Z, (hrpNow.Position - pos2).Magnitude
                 ))
                 pos = pos2
@@ -12686,7 +12864,7 @@ function GameClient.TravelTo(kind, target, aborted)
     local _, hrpEnd = getChar()
     local endPos = hrpEnd and hrpEnd.Position
     local endDist = endPos and (endPos - pos).Magnitude or -1
-    debugLog("travel_debug.txt", ("%s via=%s ok=%s aborted=%s elapsed=%.2fs endPos=%s endDist=%.1f"):format(
+    LogDebug("travel_debug.txt", ("%s via=%s ok=%s aborted=%s elapsed=%.2fs endPos=%s endDist=%.1f"):format(
         isAborted and "ABORTED" or "DONE",
         via,
         tostring(ok),
@@ -12702,9 +12880,9 @@ Features.MissionLoop = function()
     State.mobToken += 1
     local myTok = State.mobToken
     local function logMob(msg)
-        debugLog("mob_debug.txt", msg)
+        LogDebug("mob_debug.txt", msg)
     end
-    debugLog("mob_debug.txt", "=== MissionLoop START ===", true)
+    LogDebug("mob_debug.txt", "=== MissionLoop START ===", true)
     local lastLogT, lastLogMsg = 0, ""
     local function logMobThrottled(msg)
         local now = os.clock()
@@ -12907,9 +13085,9 @@ GameClient.MissionLoop = Features.MissionLoop
 end
 
 function Features.StopAllMainModes(keepBoss, keepMob, keepRaid, keepFortRaid)
-    if CFG.AutoCollectibles then debugLog("collectibles_debug.txt", "STOP reason=other_mode_started") end
+    if CFG.AutoCollectibles then LogDebug("collectibles_debug.txt", "STOP reason=other_mode_started") end
     if CFG.AutoVoxTraining then
-        debugLog(CFG.VoxTrainingType == "Armor" and "vox_armor_debug.txt" or "vox_sense_debug.txt", "STOP reason=other_mode_started")
+        LogDebug(CFG.VoxTrainingType == "Armor" and "vox_armor_debug.txt" or "vox_sense_debug.txt", "STOP reason=other_mode_started")
     end
     CFG.AutoFarm = false
     State.farmToken += 1
@@ -12928,6 +13106,12 @@ function Features.StopAllMainModes(keepBoss, keepMob, keepRaid, keepFortRaid)
         CFG.AutoBoardBoss = false
         State.bossBusy = false
         State.bossToken += 1
+        CFG.AutoIslandBoss = false
+        State.islandBossBusy = false
+        State.islandBossToken += 1
+        CFG.AutoSeaBeast = false
+        State.seaBeastBusy = false
+        State.seaBeastToken += 1
     end
     if not keepMob then
         CFG.AutoMob = false
@@ -12935,10 +13119,20 @@ function Features.StopAllMainModes(keepBoss, keepMob, keepRaid, keepFortRaid)
     end
     CFG.AutoMobDrops = false
     State.Tokens.MobDrop = (State.Tokens.MobDrop or 0) + 1
+    CFG.AutoFish = false
+    State.Tokens.Fish = (State.Tokens.Fish or 0) + 1
+    CFG.AutoDungeon = false
+    State.Tokens.Dungeon = (State.Tokens.Dungeon or 0) + 1
+    CFG.AutoBlacksmith = false
+    State.Tokens.Blacksmith = (State.Tokens.Blacksmith or 0) + 1
+    CFG.AutoForgeUpgrade = false
+    State.Tokens.ForgeUpgrade = (State.Tokens.ForgeUpgrade or 0) + 1
     if not keepRaid then
         if CFG.AutoRaid then GameClient.LeaveBossRoom() end
         CFG.AutoRaid = false
         GameClient.RaidToken = (GameClient.RaidToken or 0) + 1
+        CFG.AutoCraftRaidKey = false
+        State.Tokens.KeyCraft = (State.Tokens.KeyCraft or 0) + 1
     end
     if not keepFortRaid then
         CFG.AutoFortRaid = false
@@ -13039,7 +13233,7 @@ function GameClient.ApplyCollectibles(on, continueQueue, requestedMode)
             Status = "Parado"
         end
         if Shared.RefreshToggles then Shared.RefreshToggles() end
-        debugLog(debugFile, "STOP_REQUEST user_or_mode_change=true mode=" .. tostring(collectibleMode))
+        LogDebug(debugFile, "STOP_REQUEST user_or_mode_change=true mode=" .. tostring(collectibleMode))
         return
     end
     if continueQueue and not GameClient.CollectibleRequested then
@@ -13074,7 +13268,7 @@ function GameClient.ApplyCollectibles(on, continueQueue, requestedMode)
     local queueEntry = GameClient.CollectibleQueue and GameClient.CollectibleQueue[GameClient.CollectibleQueueIndex or 1]
     local islandName = queueEntry and queueEntry.Name
     if not islandName then
-        debugLog(debugFile, "NO_ISLAND_FOUND mode=" .. tostring(collectibleMode))
+        LogDebug(debugFile, "NO_ISLAND_FOUND mode=" .. tostring(collectibleMode))
         GameClient.CollectibleMode = nil
         GameClient.CollectibleRequested = false
         CFG[flagKey] = false
@@ -13096,7 +13290,7 @@ function GameClient.ApplyCollectibles(on, continueQueue, requestedMode)
     local myToken = GameClient.CollectibleToken
     local debugData = getData()
     local debugGold = debugData and debugData.Monetization and debugData.Monetization.Gold
-    debugLog(debugFile, ("=== %s island=%s requiredLevel=%s playerLevel=%s gold=%s token=%s queue=%s/%s ==="):format(
+    LogDebug(debugFile, ("=== %s island=%s requiredLevel=%s playerLevel=%s gold=%s token=%s queue=%s/%s ==="):format(
         continueQueue and "NEXT" or "START", tostring(islandName), tostring(queueEntry.Level), tostring(getLevel()),
         tostring(debugGold), tostring(myToken), tostring(GameClient.CollectibleQueueIndex), tostring(#GameClient.CollectibleQueue)
     ), not continueQueue and collectibleMode ~= "Secret")
@@ -13105,7 +13299,7 @@ function GameClient.ApplyCollectibles(on, continueQueue, requestedMode)
         for _, entry in ipairs(GameClient.CollectibleQueue) do
             table.insert(route, ("%s(Lv.%s)"):format(entry.Name, entry.Level and tostring(entry.Level) or "?"))
         end
-        debugLog(debugFile, "ROUTE " .. table.concat(route, " -> "))
+        LogDebug(debugFile, "ROUTE " .. table.concat(route, " -> "))
     end
     if Shared.RefreshToggles then Shared.RefreshToggles() end
 
@@ -13114,7 +13308,7 @@ function GameClient.ApplyCollectibles(on, continueQueue, requestedMode)
         -- leitura, viagem ou varredura. Assim o toggle continua responsivo.
         task.wait(0.2)
         local function logCollectibles(message)
-            debugLog(debugFile, message)
+            LogDebug(debugFile, message)
         end
         local function aborted()
             return not GameClient.CollectibleRequested or not CFG[flagKey] or GameClient.CollectibleToken ~= myToken
@@ -13413,7 +13607,7 @@ function GameClient.RunCampfireSecret()
     GameClient.CampfireActive = true
     task.spawn(function()
         local function logSecret(msg)
-            debugLog("secret_debug.txt", msg)
+            LogDebug("secret_debug.txt", msg)
         end
         local function aborted()
             return not CFG.AutoSecretAchievements or GameClient.CollectibleToken ~= myToken
@@ -13516,12 +13710,12 @@ function GameClient.RunCampfireSecret()
 end
 
 function GameClient.SecretDebugLog(msg)
-    debugLog("secret_debug.txt", msg)
+    LogDebug("secret_debug.txt", msg)
 end
 
 function GameClient.ApplySecretAchievements(on)
     if not on then
-        debugLog("secret_debug.txt", ("STOP_REQUEST user=true prevMode=%s campfire=%s"):format(
+        LogDebug("secret_debug.txt", ("STOP_REQUEST user=true prevMode=%s campfire=%s"):format(
             tostring(GameClient.CollectibleMode), tostring(GameClient.CampfireActive)
         ))
         CFG.AutoSecretAchievements = false
@@ -13551,11 +13745,11 @@ function GameClient.ApplySecretAchievements(on)
         end
     end
     table.sort(selectedKeys)
-    debugLog("secret_debug.txt", ("=== SECRET_START lv=%d selected=[%s] wantsTrophies=%s campfire=%s ==="):format(
+    LogDebug("secret_debug.txt", ("=== SECRET_START lv=%d selected=[%s] wantsTrophies=%s campfire=%s ==="):format(
         getLevel(), table.concat(selectedKeys, ", "), tostring(wantsTrophies), tostring(selected.CampfireDeath == true)
     ), true)
     if not hasSelection then
-        debugLog("secret_debug.txt", "ABORT no_selection=true")
+        LogDebug("secret_debug.txt", "ABORT no_selection=true")
         CFG.AutoSecretAchievements = false
         if Shared.RefreshToggles then Shared.RefreshToggles() end
         task.defer(function() if Shared.RefreshToggles then Shared.RefreshToggles() end end)
@@ -13563,10 +13757,10 @@ function GameClient.ApplySecretAchievements(on)
         return
     end
     if wantsTrophies then
-        debugLog("secret_debug.txt", "DISPATCH mode=trophies")
+        LogDebug("secret_debug.txt", "DISPATCH mode=trophies")
         GameClient.ApplyCollectibles(true, false, "Secret")
     elseif selected.CampfireDeath then
-        debugLog("secret_debug.txt", "DISPATCH mode=campfire_only")
+        LogDebug("secret_debug.txt", "DISPATCH mode=campfire_only")
         CFG.MainModeActive = false
         Features.StopAllMainModes(true)
         CFG.AutoSecretAchievements = true
@@ -13628,6 +13822,11 @@ Features.PauseForInterrupt = function()
         secret = CFG.AutoSecretAchievements,
         collectibleReq = GameClient.CollectibleRequested,
         collectibleMode = GameClient.CollectibleMode,
+        fish = CFG.AutoFish,
+        mobDrop = CFG.AutoMobDrops,
+        bs = CFG.AutoBlacksmith,
+        keyCraft = CFG.AutoCraftRaidKey,
+        forgeUp = CFG.AutoForgeUpgrade,
     }
     State.farmToken += 1
     State.bossToken += 1
@@ -13640,6 +13839,11 @@ Features.PauseForInterrupt = function()
     State.fortRaidBusy = false
     State.mobToken += 1
     State.storyToken += 1
+    State.Tokens.Fish = (State.Tokens.Fish or 0) + 1
+    State.Tokens.MobDrop = (State.Tokens.MobDrop or 0) + 1
+    State.Tokens.Blacksmith = (State.Tokens.Blacksmith or 0) + 1
+    State.Tokens.KeyCraft = (State.Tokens.KeyCraft or 0) + 1
+    State.Tokens.ForgeUpgrade = (State.Tokens.ForgeUpgrade or 0) + 1
     GameClient.CampfireActive = false
     GameClient.CollectibleToken = (GameClient.CollectibleToken or 0) + 1
     GameClient.stopFightingStyle()
@@ -13677,6 +13881,16 @@ Features.ResumeAfterInterrupt = function(snap)
         end
     elseif snap.mob and CFG.AutoMob and not State.bossBusy and not State.islandBossBusy and not State.seaBeastBusy and not State.fortRaidBusy then
         Features.MissionLoop()
+    elseif snap.mobDrop and CFG.AutoMobDrops and GameClient.StartMobDropFarmLoop then
+        GameClient.StartMobDropFarmLoop()
+    elseif snap.bs and CFG.AutoBlacksmith and GameClient.StartBlacksmithCraftLoop then
+        GameClient.StartBlacksmithCraftLoop()
+    elseif snap.keyCraft and CFG.AutoCraftRaidKey and not CFG.AutoRaid and GameClient.StartStandaloneKeyCraftLoop then
+        GameClient.StartStandaloneKeyCraftLoop()
+    elseif snap.forgeUp and CFG.AutoForgeUpgrade and GameClient.StartForgeUpgradeLoop then
+        GameClient.StartForgeUpgradeLoop()
+    elseif snap.fish and CFG.AutoFish and GameClient.EnsureFishLoop then
+        GameClient.EnsureFishLoop()
     elseif not (CFG.AutoBoss or CFG.AutoIslandBoss or CFG.AutoSeaBeast or CFG.AutoFortRaid or CFG.MainModeActive or CFG.AutoVoxTraining or CFG.AutoCollectibles or CFG.AutoSecretAchievements or CFG.AutoMob or CFG.AutoRaid) then
         Status = "Parado"
     end
@@ -13714,7 +13928,7 @@ function Features.HookDeath(char)
                         cancelTween()
                         Status = "Morreu, aguardando renascer..."
                         if CFG.AutoSeaBeast then
-                            debugLog("seabeast_debug.txt", "DEATH_DETECTED (HealthChanged=0)")
+                            LogDebug("seabeast_debug.txt", "DEATH_DETECTED (HealthChanged=0)")
                         end
                     end
                 elseif downed and LP.Character == char and hum:GetState() ~= Enum.HumanoidStateType.Dead and hum.MaxHealth > 0 and hp >= hum.MaxHealth * 0.5 then
@@ -13724,7 +13938,7 @@ function Features.HookDeath(char)
                     State.respawnReadyAt = os.clock() + 3
                     Status = "Renasceu, aguardando 3s..."
                     if CFG.AutoSeaBeast then
-                        debugLog("seabeast_debug.txt", ("REVIVE_DETECTED hp=%.0f/%.0f (aguardando 3s)"):format(hp, hum.MaxHealth))
+                        LogDebug("seabeast_debug.txt", ("REVIVE_DETECTED hp=%.0f/%.0f (aguardando 3s)"):format(hp, hum.MaxHealth))
                     end
                     task.delay(3, function()
                         if LP.Character == char and reviveToken == myRev and not downed then
@@ -13828,6 +14042,9 @@ GameClient.Destroy = function()
         table.clear(Features.Fruit.Items); table.clear(Features.Fruit.Skip); table.clear(Features.Fruit.StoreBlacklist)
     end
     table.clear(State.BadTargets)
+    table.clear(_debugThrottle)
+    Movement.ReleaseMoveLock(true)
+    table.clear(Movement.ThreadTags)
 end
 
 task.spawn(function()
@@ -14023,6 +14240,7 @@ function GameClient.EnsureFruitHopLoop()
             pendingFail = nil
             lastJoin = os.clock()
             if target then
+                LogDebugEvent("fruit_debug.txt", "HOP_JOIN", ("pool=%d job=%s players=%d"):format(#pool, tostring(target.JobId), tonumber(target.Players) or -1))
                 visited[target.JobId] = os.time()
                 saveVisited()
                 pcall(function()
@@ -14891,7 +15109,7 @@ function Features.InitKeyCraft()
     end
 
     function GameClient.StopStandaloneKeyCraft()
-        debugLog("keycraft_debug.txt", "STOP_REQUEST user=true")
+        LogDebug("keycraft_debug.txt", "STOP_REQUEST user=true")
         State.activeFarmQuestName = nil
         State.Tokens.KeyCraft = (State.Tokens.KeyCraft or 0) + 1
     end
@@ -14900,11 +15118,11 @@ function Features.InitKeyCraft()
         State.Tokens.KeyCraft = (State.Tokens.KeyCraft or 0) + 1
         local myTok = State.Tokens.KeyCraft
         task.spawn(function()
-            local function logKey(msg) debugLog("keycraft_debug.txt", msg) end
+            local function logKey(msg) LogDebug("keycraft_debug.txt", msg) end
             local function aborted() return not CFG.AutoCraftRaidKey or CFG.AutoRaid or State.Tokens.KeyCraft ~= myTok end
             local bossName, diff = CFG.CraftKeyBoss, CFG.CraftKeyDiff
             local wantQty = math.clamp(math.floor(tonumber(CFG.CraftKeyAmount) or 1), 1, 99)
-            debugLog("keycraft_debug.txt", ("=== KEY_CRAFT START boss=%s diff=%s wantQty=%d lv=%d ==="):format(tostring(bossName), tostring(diff), wantQty, getLevel()), true)
+            LogDebug("keycraft_debug.txt", ("=== KEY_CRAFT START boss=%s diff=%s wantQty=%d lv=%d ==="):format(tostring(bossName), tostring(diff), wantQty, getLevel()), true)
             if not (bossName and diff) then
                 logKey("ABORT reason=missing_selection")
                 CFG.AutoCraftRaidKey = false
@@ -14936,7 +15154,7 @@ function Features.InitKeyCraft()
     end
 
     function GameClient.StopBlacksmithCraft()
-        debugLog("blacksmith_debug.txt", "STOP_REQUEST user=true")
+        LogDebug("blacksmith_debug.txt", "STOP_REQUEST user=true")
         State.activeFarmQuestName = nil
         CFG.AutoBlacksmith = false
         State.Tokens.Blacksmith = (State.Tokens.Blacksmith or 0) + 1
@@ -14946,10 +15164,10 @@ function Features.InitKeyCraft()
         State.Tokens.Blacksmith = (State.Tokens.Blacksmith or 0) + 1
         local myTok = State.Tokens.Blacksmith
         task.spawn(function()
-            local function logBS(msg) debugLog("blacksmith_debug.txt", msg) end
+            local function logBS(msg) LogDebug("blacksmith_debug.txt", msg) end
             local function aborted() return not CFG.AutoBlacksmith or State.Tokens.Blacksmith ~= myTok end
             local itemName = CFG.BlacksmithTarget
-            debugLog("blacksmith_debug.txt", ("=== BLACKSMITH START item=%s amount=%s lv=%d ==="):format(tostring(itemName), tostring(CFG.BlacksmithAmount), getLevel()), true)
+            LogDebug("blacksmith_debug.txt", ("=== BLACKSMITH START item=%s amount=%s lv=%d ==="):format(tostring(itemName), tostring(CFG.BlacksmithAmount), getLevel()), true)
             local baseReq = itemName and getItemRequirements(itemName, 1)
             if not baseReq then
                 logBS(("ABORT reason=invalid_item item=%s"):format(tostring(itemName)))
@@ -15057,7 +15275,7 @@ function Features.InitKeyCraft()
         State.Tokens.ForgeUpgrade = (State.Tokens.ForgeUpgrade or 0) + 1
         local myTok = State.Tokens.ForgeUpgrade
         task.spawn(function()
-            local function logUp(msg) debugLog("forge_upgrade_debug.txt", msg) end
+            local function logUp(msg) LogDebug("forge_upgrade_debug.txt", msg) end
             local function aborted()
                 return not CFG.AutoForgeUpgrade or State.Tokens.ForgeUpgrade ~= myTok
             end
@@ -15065,7 +15283,7 @@ function Features.InitKeyCraft()
             local gearName = CFG.ForgeGearTarget
             local targetPlus = math.clamp(math.floor(tonumber(CFG.ForgeTargetPlus) or 9), 1, 9)
             local useCharm = CFG.ForgeUseCharm == true
-            debugLog("forge_upgrade_debug.txt", ("=== FORGE_%s START gear=%s targetPlus=%d charm=%s ==="):format(
+            LogDebug("forge_upgrade_debug.txt", ("=== FORGE_%s START gear=%s targetPlus=%d charm=%s ==="):format(
                 mode:upper(), tostring(gearName), targetPlus, tostring(useCharm)
             ), true)
             if type(gearName) ~= "string" or gearName == "" then
@@ -15354,7 +15572,7 @@ function Features.InitKeyCraft()
         ensureKeyCatalog()
         local entry = keyCatalog[tostring(bossName) .. "|" .. tostring(difficulty)]
         local function stepLog(msg)
-            debugLog("keycraft_debug.txt", msg)
+            LogDebug("keycraft_debug.txt", msg)
             if logFn then logFn(msg) end
         end
         stepLog(("RAID_KEY_STEP boss=%s diff=%s key=%s"):format(tostring(bossName), tostring(difficulty), tostring(entry and entry.Name or "nil")))
@@ -15400,10 +15618,12 @@ do
             return false
         end
         task.spawn(function()
+            Movement.TagThread("BlackMarketTeleport", 100)
             local gcf = (bm.GetGroundCFrame and bm.GetGroundCFrame(pt)) or pt.CFrame
             local dest = gcf.Position + gcf.LookVector * 3 + Vector3.new(0, 2, 0)
             Status = "Indo ao Black Market..."
             goNear(dest, function() return isDeadOrRespawning() end)
+            Movement.ReleaseMoveLock()
             Status = "Parado"
         end)
         return true
@@ -15455,6 +15675,7 @@ do
                             end
                         end
                         if #buyPlan > 0 then
+                            LogDebugEvent("blackmarket_debug.txt", "BUY_PLAN", ("items=%d visitKey=%s"):format(#buyPlan, tostring(visitKey)))
                             local snap = Features.PauseForInterrupt and Features.PauseForInterrupt() or nil
                             pcall(function()
                                 local gcf = (bm.GetGroundCFrame and bm.GetGroundCFrame(pt)) or pt.CFrame
@@ -16018,6 +16239,7 @@ function Shared.BuildMainUI()
                         end
                         return
                     end
+                    VoxCore.CFG.MainModeActive = false
                     if VoxCore.StopAllMainModes then VoxCore.StopAllMainModes(true, true) end
                     VoxCore.CFG.AutoRaid = false
                     VoxCore.Client.RaidToken = (VoxCore.Client.RaidToken or 0) + 1
@@ -16586,7 +16808,14 @@ function Shared.BuildMainUI()
             Callback = function(on)
                 if Shared.RefreshingToggles and not on then return end
                 if VoxCore and VoxCore.CFG then
-                    VoxCore.CFG.AutoFish = (on == true)
+                    if on then
+                        VoxCore.CFG.MainModeActive = false
+                        if VoxCore.StopAllMainModes then VoxCore.StopAllMainModes(true) end
+                        VoxCore.CFG.AutoFish = true
+                        if Shared.RefreshToggles then Shared.RefreshToggles() end
+                    else
+                        VoxCore.CFG.AutoFish = false
+                    end
                     if VoxCore.Client and VoxCore.Client.EnsureFishLoop then
                         VoxCore.Client.EnsureFishLoop()
                     end
@@ -16713,11 +16942,8 @@ function Shared.BuildMainUI()
                 if Shared.RefreshingToggles and not on then return end
                 if not (VoxCore and VoxCore.CFG and VoxCore.Client) then return end
                 if on then
-                    VoxCore.CFG.AutoBoss = false
-                    VoxCore.CFG.AutoIslandBoss = false
-                    VoxCore.CFG.AutoSeaBeast = false
-                    VoxCore.CFG.AutoFortRaid = false
-                    VoxCore.CFG.AutoFish = false
+                    VoxCore.CFG.MainModeActive = false
+                    if VoxCore.StopAllMainModes then VoxCore.StopAllMainModes(false, false, true, false) end
                     VoxCore.CFG.AutoRaid = true
                     if Shared.RefreshToggles then Shared.RefreshToggles() end
                     if VoxCore.Client.StartRaidLoop then VoxCore.Client.StartRaidLoop() end
@@ -16797,13 +17023,23 @@ function Shared.BuildMainUI()
             Callback = function(on)
                 if Shared.RefreshingToggles and not on then return end
                 if not (VoxCore and VoxCore.CFG and VoxCore.Client) then return end
-                VoxCore.CFG.AutoCraftRaidKey = (on == true)
                 if on then
-                    if not VoxCore.CFG.AutoRaid and VoxCore.Client.StartStandaloneKeyCraftLoop then
-                        VoxCore.Client.StartStandaloneKeyCraftLoop()
+                    if not VoxCore.CFG.AutoRaid then
+                        VoxCore.CFG.MainModeActive = false
+                        if VoxCore.StopAllMainModes then VoxCore.StopAllMainModes(true) end
+                        VoxCore.CFG.AutoCraftRaidKey = true
+                        if Shared.RefreshToggles then Shared.RefreshToggles() end
+                        if VoxCore.Client.StartStandaloneKeyCraftLoop then
+                            VoxCore.Client.StartStandaloneKeyCraftLoop()
+                        end
+                    else
+                        VoxCore.CFG.AutoCraftRaidKey = true
                     end
-                elseif VoxCore.Client.StopStandaloneKeyCraft then
-                    VoxCore.Client.StopStandaloneKeyCraft()
+                else
+                    VoxCore.CFG.AutoCraftRaidKey = false
+                    if VoxCore.Client.StopStandaloneKeyCraft then
+                        VoxCore.Client.StopStandaloneKeyCraft()
+                    end
                 end
             end,
         })
@@ -16842,9 +17078,8 @@ function Shared.BuildMainUI()
                 if Shared.RefreshingToggles and not on then return end
                 if not (VoxCore and VoxCore.CFG and VoxCore.Client) then return end
                 if on then
-                    VoxCore.CFG.AutoRaid = false
-                    VoxCore.Client.RaidToken = (VoxCore.Client.RaidToken or 0) + 1
-                    VoxCore.CFG.AutoFish = false
+                    VoxCore.CFG.MainModeActive = false
+                    if VoxCore.StopAllMainModes then VoxCore.StopAllMainModes(false, false, false, false) end
                     VoxCore.CFG.AutoDungeon = true
                     if Shared.RefreshToggles then Shared.RefreshToggles() end
                     if VoxCore.Client.StartDungeonLoop then VoxCore.Client.StartDungeonLoop() end
@@ -16915,16 +17150,18 @@ function Shared.BuildMainUI()
             Callback = function(on)
                 if Shared.RefreshingToggles and not on then return end
                 if not (VoxCore and VoxCore.CFG and VoxCore.Client) then return end
-                VoxCore.CFG.AutoBlacksmith = (on == true)
                 if on then
+                    VoxCore.CFG.MainModeActive = false
+                    if VoxCore.StopAllMainModes then VoxCore.StopAllMainModes(true) end
+                    VoxCore.CFG.AutoBlacksmith = true
+                    if Shared.RefreshToggles then Shared.RefreshToggles() end
                     if VoxCore.Client.StartBlacksmithCraftLoop then
                         VoxCore.Client.StartBlacksmithCraftLoop()
                     end
                 else
+                    VoxCore.CFG.AutoBlacksmith = false
                     if VoxCore.Client.StopBlacksmithCraft then
                         VoxCore.Client.StopBlacksmithCraft()
-                    else
-                        VoxCore.CFG.AutoBlacksmith = false
                     end
                 end
             end,
@@ -17012,11 +17249,17 @@ function Shared.BuildMainUI()
             Callback = function(on)
                 if Shared.RefreshingToggles and not on then return end
                 if not (VoxCore and VoxCore.CFG and VoxCore.Client) then return end
-                VoxCore.CFG.AutoForgeUpgrade = (on == true)
                 if on then
+                    VoxCore.CFG.MainModeActive = false
+                    if VoxCore.StopAllMainModes then VoxCore.StopAllMainModes(true) end
+                    VoxCore.CFG.AutoForgeUpgrade = true
+                    if Shared.RefreshToggles then Shared.RefreshToggles() end
                     if VoxCore.Client.StartForgeUpgradeLoop then VoxCore.Client.StartForgeUpgradeLoop() end
-                elseif VoxCore.Client.StopForgeUpgrade then
-                    VoxCore.Client.StopForgeUpgrade()
+                else
+                    VoxCore.CFG.AutoForgeUpgrade = false
+                    if VoxCore.Client.StopForgeUpgrade then
+                        VoxCore.Client.StopForgeUpgrade()
+                    end
                 end
             end,
         })
@@ -17201,8 +17444,10 @@ function Shared.BuildMainUI()
                 travelRunning = true
                 task.spawn(function()
                     pcall(function()
+                        if VoxCore.Client.TagMoveThread then VoxCore.Client.TagMoveThread("ManualTravel", 100) end
                         VoxCore.Client.TravelTo(kind, target, function() return travelToken ~= myTok end)
                     end)
+                    if VoxCore.Client.ReleaseMoveLock then VoxCore.Client.ReleaseMoveLock() end
                     if travelToken == myTok then
                         travelRunning = false
                         local tg = travelActiveTG or (Toggles and Toggles.TravelActive)
