@@ -158,101 +158,33 @@ end
 
 local Now = tick
 
-local AsyncState = {
-    ErrorCooldown = 2,
-    LastErrorTick = {},
-}
-
-local RuntimeRefInfra = {
-    SafeRefs = {
-        pcall = pcall,
-        xpcall = xpcall,
-        table_pack = table.pack,
-        unpack = table.unpack or unpack,
-        task_spawn = SafeRuntime.RawTask.spawn,
-        task_defer = SafeRuntime.RawTask.defer,
-        debug_traceback = type(debug) == "table" and debug.traceback or nil,
-    },
-}
-
-local AsyncInfra = AsyncState
-
 local function GetSafeHttpRequestFunction()
-    if type(request) == "function" then
-        return request, "request"
-    end
-    if type(http_request) == "function" then
-        return http_request, "http_request"
-    end
-    if type(syn) == "table" and type(syn.request) == "function" then
-        return syn.request, "syn.request"
-    end
-    if type(http) == "table" and type(http.request) == "function" then
-        return http.request, "http.request"
-    end
-
+    if type(request) == "function" then return request, "request" end
+    if type(http_request) == "function" then return http_request, "http_request" end
+    if type(syn) == "table" and type(syn.request) == "function" then return syn.request, "syn.request" end
+    if type(http) == "table" and type(http.request) == "function" then return http.request, "http.request" end
     return nil, nil
 end
 
 local function pruneOldestTickEntries(cache, maxEntries)
-    if type(cache) ~= "table" then
-        return
-    end
-
+    if type(cache) ~= "table" then return end
     maxEntries = tonumber(maxEntries) or 0
-    if maxEntries <= 0 then
-        return
-    end
-
-    local count = 0
-    for _ in pairs(cache) do
-        count = count + 1
-    end
-
-    if count <= maxEntries then
-        return
-    end
-
+    if maxEntries <= 0 then return end
     local entries = {}
     for key, tickValue in pairs(cache) do
-        entries[#entries + 1] = {
-            Key = key,
-            Tick = tonumber(tickValue) or 0,
-        }
+        entries[#entries + 1] = { Key = key, Tick = tonumber(tickValue) or 0 }
     end
-
-    table.sort(entries, function(a, b)
-        return a.Tick < b.Tick
-    end)
-
-    local removeCount = count - maxEntries
-    for index = 1, removeCount do
-        local entry = entries[index]
-        if entry then
-            cache[entry.Key] = nil
-        end
+    if #entries <= maxEntries then return end
+    table.sort(entries, function(a, b) return a.Tick < b.Tick end)
+    for index = 1, #entries - maxEntries do
+        cache[entries[index].Key] = nil
     end
 end
 
-RuntimeRefInfra.GetSafeHttpRequestFunction = GetSafeHttpRequestFunction
-
-local BootstrapStateInfra = {
-    BootingKey = "Midgard_Booting",
-    RunningKey = "Midgard_Running",
-    RuntimeTokenKey = "Midgard_RuntimeToken",
-}
-
+local BootstrapStateInfra = { BootingKey = "Midgard_Booting", RunningKey = "Midgard_Running", RuntimeTokenKey = "Midgard_RuntimeToken" }
 local Shared
-local PreviousRuntimeState = {
-    Unload = GlobalEnv.Midgard_Unload,
-    Library = GlobalEnv.Midgard_Library,
-}
-
-local HttpInfra = {
-    DiscordRpcUrl = "http://127.0.0.1:6463/rpc?v=1",
-    DiscordRpcOrigin = "https://discord.com",
-}
-
+local PreviousRuntimeState = { Unload = GlobalEnv.Midgard_Unload, Library = GlobalEnv.Midgard_Library }
+local HttpInfra = { DiscordRpcUrl = "http://127.0.0.1:6463/rpc?v=1", DiscordRpcOrigin = "https://discord.com" }
 local RepoConfig = {
     BaseUrl = LPH_ENCSTR("https://raw.githubusercontent.com/matheusmerigo/midgard.ui/refs/heads/main/"),
     LibraryOverrideUrl = LPH_ENCSTR("https://raw.githubusercontent.com/matheusmerigo/midgard.ui/refs/heads/main/Library.lua"),
@@ -260,250 +192,20 @@ local RepoConfig = {
     LibraryPath = "Library.lua",
     SaveManagerPath = "Save%20Manager.lua",
 }
-
-local ClientPublicConfig = {
-    InviteCode = "pW2X3GtveU",
-    AvatarUrl = "https://i.imgur.com/L6ZzYnB.png",
-}
-
+local ClientPublicConfig = { InviteCode = "pW2X3GtveU", AvatarUrl = "https://i.imgur.com/L6ZzYnB.png" }
 local InviteUrl = "https://discord.gg/" .. tostring(ClientPublicConfig.InviteCode or "")
-
-local GenericInfra = {
-    Core = {},
-    Async = {},
-    Bootstrap = {},
-    UI = {},
-    Config = {},
-}
-
-local InitialPackFn = RuntimeRefInfra.SafeRefs.table_pack or table.pack or function(...)
-    return { n = select("#", ...), ... }
+local GenericInfra = { Bootstrap = {} }
+local WarnAsyncThrottled = SafeRuntime.ReportError
+local function TaskSpawn(a, b, ...)
+    if type(a) == "function" then return task.spawn(a, b, ...) end
+    if type(b) == "function" then return task.spawn(b, ...) end
 end
-GenericInfra.Async.PackArgs = function(...)
-    if type(Library) == "table" and type(Library.PackArgs) == "function" then
-        return Library:PackArgs(...)
-    end
-    return InitialPackFn(...)
+local function TaskDefer(a, b, ...)
+    if type(a) == "function" then return task.defer(a, b, ...) end
+    if type(b) == "function" then return task.defer(b, ...) end
 end
-local PackArgs = GenericInfra.Async.PackArgs
-
-GenericInfra.Async.NormalizeInvocation = function(contextOrCallback, callbackOrArg, ...)
-    if type(Library) == "table" and type(Library.NormalizeAsyncInvocation) == "function" then
-        return Library:NormalizeAsyncInvocation(contextOrCallback, callbackOrArg, ...)
-    end
-    if type(contextOrCallback) == "function" then
-        return "async", contextOrCallback, PackArgs(callbackOrArg, ...)
-    end
-    if type(contextOrCallback) == "string" and contextOrCallback ~= "" and type(callbackOrArg) == "function" then
-        return contextOrCallback, callbackOrArg, PackArgs(...)
-    end
-    if type(contextOrCallback) == "table" and type(contextOrCallback.Name) == "string" and type(callbackOrArg) == "function" then
-        return contextOrCallback.Name, callbackOrArg, PackArgs(...)
-    end
-    return nil, nil, nil
-end
-local NormalizeAsyncInvocation = GenericInfra.Async.NormalizeInvocation
-
-GenericInfra.Async.WarnThrottled = function(scopeName, err)
-    local entries = AsyncInfra.LastErrorTick
-    local key = tostring(scopeName or "async")
-    local now = Now()
-    local lastTick = entries[key] or 0
-    if (now - lastTick) < AsyncInfra.ErrorCooldown then
-        return
-    end
-    entries[key] = now
-    if (now - (AsyncInfra.LastErrorPruneAt or 0)) >= 60 then
-        AsyncInfra.LastErrorPruneAt = now
-        local cutoff = now - 300
-        for scope, tickValue in pairs(entries) do
-            if type(tickValue) ~= "number" or tickValue < cutoff then
-                entries[scope] = nil
-            end
-        end
-    end
-    pruneOldestTickEntries(entries, 256)
-    warn("[Midgard] Async callback error [" .. key .. "]: " .. tostring(err))
-end
-local WarnAsyncThrottled = GenericInfra.Async.WarnThrottled
-
-local ProtectedExecutionRefs
-local function getProtectedExecutionRefs()
-    if ProtectedExecutionRefs then
-        return ProtectedExecutionRefs.Xpcall, ProtectedExecutionRefs.Unpack, ProtectedExecutionRefs.Traceback
-    end
-
-    local refs = RuntimeRefInfra.SafeRefs
-    ProtectedExecutionRefs = {
-        Xpcall = refs.xpcall or xpcall,
-        Unpack = refs.unpack or table.unpack or unpack,
-        Traceback = refs.debug_traceback or (type(debug) == "table" and debug.traceback) or function(err)
-            return tostring(err)
-        end,
-    }
-
-    return ProtectedExecutionRefs.Xpcall, ProtectedExecutionRefs.Unpack, ProtectedExecutionRefs.Traceback
-end
-
-local function executeProtectedPacked(callback, packedArgs)
-    local xpcallFn, unpackFn, tracebackFn = getProtectedExecutionRefs()
-    return xpcallFn(function()
-        return callback(unpackFn(packedArgs, 1, packedArgs.n))
-    end, tracebackFn)
-end
-
-GenericInfra.Async.RunProtected = function(callback, packedArgs, scopeName)
-    if type(Library) == "table" and type(Library.RunProtectedAsync) == "function" then
-        return Library:RunProtectedAsync(callback, packedArgs, scopeName)
-    end
-
-    local ok, err = executeProtectedPacked(callback, packedArgs)
-    if not ok then
-        WarnAsyncThrottled(scopeName, err)
-    end
-end
-local RunProtectedAsync = GenericInfra.Async.RunProtected
-
-GenericInfra.Async.TaskSpawn = function(contextOrCallback, callbackOrArg, ...)
-    local scopeName, callback, packed = NormalizeAsyncInvocation(contextOrCallback, callbackOrArg, ...)
-    if type(callback) ~= "function" then
-        return
-    end
-
-    local taskSpawn = RuntimeRefInfra.SafeRefs.task_spawn
-    if type(taskSpawn) == "function" then
-        return taskSpawn(function()
-            RunProtectedAsync(callback, packed, scopeName or "task.spawn")
-        end)
-    end
-
-    return coroutine.wrap(function()
-        RunProtectedAsync(callback, packed, scopeName or "task.spawn")
-    end)()
-end
-local TaskSpawn = GenericInfra.Async.TaskSpawn
-
-GenericInfra.Async.TaskDefer = function(contextOrCallback, callbackOrArg, ...)
-    local scopeName, callback, packed = NormalizeAsyncInvocation(contextOrCallback, callbackOrArg, ...)
-    if type(callback) ~= "function" then
-        return
-    end
-
-    local taskDefer = RuntimeRefInfra.SafeRefs.task_defer
-    if type(taskDefer) == "function" then
-        return taskDefer(function()
-            RunProtectedAsync(callback, packed, scopeName or "task.defer")
-        end)
-    end
-
-    local taskSpawn = RuntimeRefInfra.SafeRefs.task_spawn
-    if type(taskSpawn) == "function" then
-        return taskSpawn(function()
-            RunProtectedAsync(callback, packed, scopeName or "task.defer")
-        end)
-    end
-
-    return coroutine.wrap(function()
-        RunProtectedAsync(callback, packed, scopeName or "task.defer")
-    end)()
-end
-local TaskDefer = GenericInfra.Async.TaskDefer
-
-AsyncInfra.RunProtectedAsync = RunProtectedAsync
-AsyncInfra.TaskSpawn = TaskSpawn
-AsyncInfra.TaskDefer = TaskDefer
-RunProtectedAsync = function(...) return AsyncInfra.RunProtectedAsync(...) end
-TaskSpawn = function(...) return AsyncInfra.TaskSpawn(...) end
-TaskDefer = function(...) return AsyncInfra.TaskDefer(...) end
-
-GenericInfra.Core.ResolveWithFallback = function(expectedType, value, fallback)
-    if type(value) == expectedType then return value end
-    return fallback
-end
-local resolveWithFallback = GenericInfra.Core.ResolveWithFallback
-
-GenericInfra.Config.GetToggleValue = function(container, key, defaultValue)
-    if type(Library) == "table" and type(Library.GetToggleValue) == "function" then
-        return Library:GetToggleValue(container, key, defaultValue)
-    end
-    local entry = container and container[key]
-    local value = type(entry) == "table" and entry.Value or nil
-    if value == nil then
-        return defaultValue == true
-    end
-    return value == true
-end
-
-GenericInfra.Config.GetOptionValue = function(container, key, defaultValue)
-    if type(Library) == "table" and type(Library.GetOptionValue) == "function" then
-        return Library:GetOptionValue(container, key, defaultValue)
-    end
-    local entry = container and container[key]
-    local value = type(entry) == "table" and entry.Value or nil
-    if value ~= nil then
-        return value
-    end
-    return defaultValue
-end
-
-GenericInfra.Config.GetOptionTable = function(container, key)
-    if type(Library) == "table" and type(Library.GetOptionTable) == "function" then
-        return Library:GetOptionTable(container, key)
-    end
-    local value = GenericInfra.Config.GetOptionValue(container, key, nil)
-    if type(value) == "table" then
-        return value
-    end
-    return {}
-end
-
-GenericInfra.Config.GetOptionString = function(container, key, defaultValue)
-    if type(Library) == "table" and type(Library.GetOptionString) == "function" then
-        return Library:GetOptionString(container, key, defaultValue)
-    end
-    local value = GenericInfra.Config.GetOptionValue(container, key, defaultValue or "")
-    if type(value) == "string" then
-        return value
-    end
-    return defaultValue or ""
-end
-
-GenericInfra.UI.AddControl = function(tab, methodName, id, props, onChanged)
-    if type(Library) == "table" and type(Library.AddBoundControl) == "function" then
-        return Library:AddBoundControl(tab, methodName, id, props, onChanged)
-    end
-
-    if type(tab) ~= "table" or type(tab[methodName]) ~= "function" then
-        return nil
-    end
-
-    tab[methodName](tab, id, props)
-    local control = (type(Options) == "table" and Options[id]) or (type(Toggles) == "table" and Toggles[id])
-    if control and type(control.OnChanged) == "function" and type(onChanged) == "function" then
-        control:OnChanged(onChanged)
-    end
-    return control
-end
-
-GenericInfra.UI.AddLabeledToggle = function(tab, id, text, defaultValue)
-    if type(Library) == "table" and type(Library.AddLabeledToggle) == "function" then
-        return Library:AddLabeledToggle(tab, id, text, defaultValue)
-    end
-
-    return GenericInfra.UI.AddControl(tab, "AddToggle", id, {
-        Text = text,
-        Default = defaultValue == true,
-    })
-end
-
-local GetToggleValue = GenericInfra.Config.GetToggleValue
-local GetOptionValue = GenericInfra.Config.GetOptionValue
-local GetOptionTable = GenericInfra.Config.GetOptionTable
-local GetOptionString = GenericInfra.Config.GetOptionString
-
-local cloneref = resolveWithFallback("function", cloneref, function(...) return ... end)
-local HttpRequestFn = RuntimeRefInfra.GetSafeHttpRequestFunction()
-
+local cloneref = type(cloneref) == "function" and cloneref or function(...) return ... end
+local HttpRequestFn = GetSafeHttpRequestFunction()
 local Services = setmetatable({}, {
     __index = LPH_NO_VIRTUALIZE(function(self, name)
         local success, cache = pcall(function()
@@ -729,20 +431,6 @@ do
     SaveManager = LoadRequired("SaveManager", saveManagerUrl .. cacheBust)
 end
 
-if Library then
-    if type(Library.RunProtectedAsync) == "function" then
-        AsyncInfra.RunProtectedAsync = function(callback, packedArgs, scopeName)
-            return Library:RunProtectedAsync(callback, packedArgs, scopeName)
-        end
-    end
-    if type(Library.TaskSpawn) == "function" then
-        AsyncInfra.TaskSpawn = function(...) return Library:TaskSpawn(...) end
-    end
-    if type(Library.TaskDefer) == "function" then
-        AsyncInfra.TaskDefer = function(...) return Library:TaskDefer(...) end
-    end
-end
-
 GlobalEnv[BootstrapStateInfra.RunningKey] = true
 GlobalEnv[BootstrapStateInfra.RuntimeTokenKey] = MidgardRuntimeToken
 GlobalEnv.Midgard_Library = Library
@@ -866,8 +554,10 @@ end
 
 function Shared.ExecuteProtectedCallback(scopeName, callback, ...)
     if type(callback) ~= "function" then return false, "invalid callback" end
-    local packed = PackArgs(...)
-    return executeProtectedPacked(callback, packed)
+    local packed = table.pack(...)
+    return xpcall(function()
+        return callback(table.unpack(packed, 1, packed.n))
+    end, SafeRuntime.Traceback)
 end
 
 local function IsManagedTaskAlive(handle)
@@ -878,20 +568,19 @@ local function StartManagedTask(container, key, label, fn, ...)
     if type(container) ~= "table" or type(key) ~= "string" or key == "" or type(fn) ~= "function" then
         return nil
     end
-
     local active = container[key]
     if IsManagedTaskAlive(active) then
         task.cancel(active)
         container[key] = nil
     end
-
     local placeholder = {}
     container[key] = placeholder
-
-    local args = PackArgs(...)
+    local args = table.pack(...)
     local handle
-    handle = TaskSpawn(label or key, function()
-        local ok, err = executeProtectedPacked(fn, args)
+    handle = task.spawn(function()
+        local ok, err = xpcall(function()
+            return fn(table.unpack(args, 1, args.n))
+        end, SafeRuntime.Traceback)
         if not ok then
             WarnAsyncThrottled(label or key, err)
         end
@@ -899,7 +588,6 @@ local function StartManagedTask(container, key, label, fn, ...)
             container[key] = nil
         end
     end)
-
     if container[key] == placeholder then
         container[key] = handle
     end
@@ -1829,6 +1517,122 @@ function GameClient.FireServerLogged(logFile, context, ...)
     return ok, err
 end
 
+GameClient._RemoteEvents = {}
+GameClient._RemoteFunctions = {}
+
+function GameClient.GetRemoteEvent(name)
+    local cached = GameClient._RemoteEvents[name]
+    if cached and cached.Parent then return cached end
+    local ni = ReplicatedStorage:FindFirstChild("NetworkInstances")
+    local re = ni and ni:FindFirstChild("RemoteEvents")
+    local ev = re and re:FindFirstChild(name)
+    if ev then GameClient._RemoteEvents[name] = ev end
+    return ev
+end
+
+function GameClient.GetRemoteFunction(name)
+    local cached = GameClient._RemoteFunctions[name]
+    if cached and cached.Parent then return cached end
+    local ni = ReplicatedStorage:FindFirstChild("NetworkInstances")
+    local rf = ni and ni:FindFirstChild("RemoteFunctions")
+    local fn = rf and rf:FindFirstChild(name)
+    if fn then GameClient._RemoteFunctions[name] = fn end
+    return fn
+end
+
+function GameClient.FireNet(remoteName, ...)
+    local args = table.pack(...)
+    if GameModules and GameModules.Network and GameModules.Network.FireServer then
+        return pcall(function()
+            GameModules.Network:FireServer(remoteName, table.unpack(args, 1, args.n))
+        end)
+    end
+    local ev = GameClient.GetRemoteEvent(remoteName)
+    if ev then
+        return pcall(function()
+            ev:FireServer(table.unpack(args, 1, args.n))
+        end)
+    end
+    return false, "RemoteEvent unavailable: " .. tostring(remoteName)
+end
+
+function GameClient.InvokeNet(timeout, remoteName, ...)
+    local args = table.pack(...)
+    if GameModules and GameModules.Network and GameModules.Network.SafeInvokeServer then
+        return pcall(function()
+            return GameModules.Network:SafeInvokeServer(timeout or 5, remoteName, table.unpack(args, 1, args.n))
+        end)
+    end
+    local fn = GameClient.GetRemoteFunction(remoteName)
+    if fn then
+        return pcall(function()
+            return fn:InvokeServer(table.unpack(args, 1, args.n))
+        end)
+    end
+    return false, "RemoteFunction unavailable: " .. tostring(remoteName)
+end
+
+function GameClient.Converse(npcName, ...)
+    if Movement and Movement.BeginInteract then
+        Movement.BeginInteract(nil)
+    end
+    return GameClient.FireNet("Elysium_Converse", npcName, ...)
+end
+
+function GameClient.InvokeConverse(timeout, npcName, ...)
+    if Movement and Movement.BeginInteract then
+        Movement.BeginInteract(nil)
+    end
+    return GameClient.InvokeNet(timeout or 5, "Elysium_Converse", npcName, ...)
+end
+
+function GameClient.GetNpcFrontCFrame(npcOrName, fallbackPos, distFromNpc)
+    local dist = tonumber(distFromNpc) or 3
+    local kCF = nil
+    if typeof(npcOrName) == "Instance" and npcOrName:IsA("Model") then
+        pcall(function() kCF = npcOrName:GetPivot() end)
+    elseif type(npcOrName) == "string" and npcOrName ~= "" then
+        if fallbackPos and MainModules and MainModules.TravelUtils and MainModules.TravelUtils.FindKeeper and npcOrName:match("Mirror Keeper") then
+            local ok, keeper = pcall(MainModules.TravelUtils.FindKeeper, fallbackPos)
+            if ok and keeper and keeper.GetPivot then kCF = keeper:GetPivot() end
+        end
+        if not kCF then
+            local ign = workspace:FindFirstChild("IgnoreList")
+            local npcs = ign and ign:FindFirstChild("Int") and ign.Int:FindFirstChild("NPCs")
+            if npcs then
+                local found = npcs:FindFirstChild(npcOrName, true)
+                if found and found:IsA("Model") then kCF = found:GetPivot()
+                elseif found and found:IsA("BasePart") then kCF = found.CFrame end
+            end
+        end
+        if not kCF then
+            local chars = playability("Characters")
+            if chars then
+                for _, npc in ipairs(chars:GetChildren()) do
+                    if npc:IsA("Model") and ((npc:GetAttribute("OriginalName") or npc.Name) == npcOrName) then
+                        kCF = npc:GetPivot()
+                        break
+                    end
+                end
+            end
+        end
+        if not kCF then
+            local pt = GameClient.GetInterestPoint("Character_" .. npcOrName)
+            if typeof(pt) == "CFrame" then kCF = pt
+            elseif typeof(pt) == "Instance" and pt:IsA("CFrameValue") then kCF = pt.Value
+            elseif type(pt) == "table" and typeof(rawget(pt, "CFrame")) == "CFrame" then kCF = rawget(pt, "CFrame") end
+        end
+    end
+    if kCF then
+        local frontPos = kCF.Position + kCF.LookVector * dist + Vector3.new(0, 2, 0)
+        return CFrame.lookAt(frontPos, kCF.Position)
+    end
+    if fallbackPos then
+        return CFrame.lookAt(fallbackPos + Vector3.new(0, 2, dist), fallbackPos)
+    end
+    return nil
+end
+
 -- Adaptador fino para APIs oficiais do cliente. Os fallbacks continuam locais
 -- para tolerar streaming parcial, mas o caminho principal passa pelos módulos.
 function GameClient.ValuePosition(value)
@@ -1878,6 +1682,27 @@ function GameClient.GetInteractionClient()
         GameClient.InteractionSystem = require(ReplicatedStorage.Modules.Essentials.InteractionSystem).IsClient
     end)
     return GameClient.InteractionSystem
+end
+
+function GameClient.GetDialogueClient()
+    if GameClient.DialogueClient then return GameClient.DialogueClient end
+    pcall(function()
+        GameClient.DialogueClient = require(ReplicatedStorage.Modules.Essentials.InteractionSystem["InteractionSystem Client"].Dialogue)
+    end)
+    return GameClient.DialogueClient
+end
+
+function GameClient.TryNativeRepeatQuest(targetQuestName)
+    local qs = GameClient.GetQuestClient and GameClient.GetQuestClient()
+    local rq = qs and qs.RepeatQuest
+    if rq and rq.QuestName and (not targetQuestName or rq.QuestName == targetQuestName)
+        and (rq.ExpiresAt or 0) > workspace:GetServerTimeNow()
+    then
+        State.repeatPendingUntil = os.clock() + 1.5
+        GameClient.FireNet("Quests", "Repeat")
+        return true
+    end
+    return false
 end
 
 local function getLevel()
@@ -2710,7 +2535,10 @@ function Features.InitCombatCore()
                                 task.wait(0.25)
                                 continue_ = true
                             else
-                                if not Features.TryAcceptQuest(bName, bInfo, aborted) then
+                                if GameClient.TryNativeRepeatQuest(bName) then
+                                    Status = "Repetindo quest..."
+                                    task.wait(0.35)
+                                elseif not Features.TryAcceptQuest(bName, bInfo, aborted) then
                                     State.questCooldown = os.clock() + 15 -- não spamma se o servidor recusar
                                     Status = "Não consegui aceitar a quest, farmando sem quest"
                                     logFarm(("QUEST_ACCEPT_FAIL %s (lv=%d)"):format(tostring(bName), lvl))
@@ -4478,9 +4306,7 @@ do
                 local cooling = true
                 pcall(function() cooling = MainModules.HaggleUtils.IsCoolingDown(nil, "Shipwright") end)
                 if not cooling then
-                    local okH, resH = pcall(function()
-                        return GameModules.Network:SafeInvokeServer(5, "Elysium_Converse", npcName, "HaggleFish")
-                    end)
+                    local okH, resH = GameClient.InvokeConverse(5, npcName, "HaggleFish")
                     if okH and resH == "Accepted" then
                         haggleAccepted = true
                         task.wait(0.35)
@@ -4490,9 +4316,7 @@ do
 
             local stillLeft = haggleAccepted and countSellableFish(fishSet) or beforeCount
             if stillLeft > 0 then
-                pcall(function()
-                    GameModules.Network:FireServer("Elysium_Converse", npcName, "SellFish")
-                end)
+                GameClient.Converse(npcName, "SellFish")
             end
 
             task.wait(0.55)
@@ -5148,7 +4972,7 @@ local function talkStyleNpc(npcName, arg, aborted)
     -- Fire the Converse action on the server directly
     -- This is how the game's dialogue system resolves NPC actions
     pcall(function()
-        GameModules.Network:FireServer("Elysium_Converse", npcName, arg)
+        GameClient.Converse(npcName, arg)
     end)
     task.wait(0.35)
     -- Also try pressing E / Dialogue interaction to open conversation UI
@@ -5832,96 +5656,45 @@ local function nextAvailableHistoryQuest()
     return nil
 end
 
-GameClient.SECONDARY_QUEST_GIVERS = {
-    ["The Sky Hermit"] = "Sky Hermit",
-    ["Flowers for the Dead"] = "Woman in Mourning",
-    ["The Great Show"] = "Circus Ringmaster",
-    ["The Lost Inscriptions"] = "Curious Man",
-    ["The Phantom Tablet"] = "Mysterious Monk",
-    ["The Missing Performer"] = "Worried Brother",
-    ["The Thirsty Merchant"] = "Thirsty Merchant",
-    ["The Impossible Ice"] = "Frost Ice Merchant",
-    ["The Snowman"] = "Snowman Kid",
-    ["The Witch's Potion"] = "Witch",
-    ["The Lost Explorer"] = "Lost Explorer",
-    ["Ocean Cleanup"] = "Garbage Collector",
-    ["Sea Delivery"] = "Harbor Shipping Merchant",
-    ["The Seven Seas Messenger"] = "Sea Postman",
-    ["The Wheat Harvest"] = "Rustfall Old Farmer",
-    ["The Prisoner's Letter"] = "Shackled Prisoner",
-    ["The Contraband"] = "Cargo Porter Prisoner",
-    ["The Champion's Armor"] = "Valoria Island Blacksmith",
-    ["The Rookie Gladiator"] = "Rookie Gladiator",
-    ["Message to the Skies"] = "Rustfall Messenger",
-    ["Celestial Feathers"] = "Windhaven Scholar",
-    ["Shadow over Kraken's Rest"] = "Corwin Hale",
-    ["The Pawnbroker's Map"] = "Pawnbroker",
-    ["The VoidWalker's End"] = "One-Eyed Vorn",
+GameClient.SECONDARY_QUESTS = {
+    { "The Runaway Cat", nil, "Solmar Island" },
+    { "The Sky Hermit", "Sky Hermit", "Solmar Island" },
+    { "Flowers for the Dead", "Woman in Mourning", "Forbidden Island" },
+    { "The Great Show", "Circus Ringmaster", "Circus Town" },
+    { "The Lost Inscriptions", "Curious Man", "Golden Dunes" },
+    { "The Phantom Tablet", "Mysterious Monk", "Golden Dunes" },
+    { "The Missing Performer", "Worried Brother", "Golden Dunes" },
+    { "The Thirsty Merchant", "Thirsty Merchant", "Golden Dunes" },
+    { "The Impossible Ice", "Frost Ice Merchant", "Frost Island" },
+    { "Frozen Catch", nil, "Frost Island" },
+    { "The Snowman", "Snowman Kid", "Frost Island" },
+    { "The Witch's Potion", "Witch", "Forbidden Island" },
+    { "The Lost Explorer", "Lost Explorer", "Skull Island" },
+    { "Ocean Cleanup", "Garbage Collector", "Shark Park" },
+    { "Sea Delivery", "Harbor Shipping Merchant", "Shark Park" },
+    { "The Seven Seas Messenger", "Sea Postman", "Shark Park" },
+    { "The Wheat Harvest", "Rustfall Old Farmer", "Rustfall" },
+    { "The Broken Mill", nil, "Rustfall" },
+    { "The Lost Key", nil, "Prison" },
+    { "The Prisoner's Letter", "Shackled Prisoner", "Prison" },
+    { "The Contraband", "Cargo Porter Prisoner", "Prison" },
+    { "The Champion's Armor", "Valoria Island Blacksmith", "Valoria Island" },
+    { "The Rookie Gladiator", "Rookie Gladiator", "Valoria Island" },
+    { "Message to the Skies", "Rustfall Messenger", "Rustfall" },
+    { "Celestial Feathers", "Windhaven Scholar", "Windhaven" },
+    { "The Hidden Clock", nil, "Windhaven" },
+    { "Shadow over Kraken's Rest", "Corwin Hale", "Wandering Bastille" },
+    { "The Pawnbroker's Map", "Pawnbroker", "Harbor Island" },
+    { "The VoidWalker's End", "One-Eyed Vorn", "Kraken's rest" },
 }
-
-GameClient.SECONDARY_QUEST_ORDER = {
-    "The Runaway Cat",
-    "The Sky Hermit",
-    "Flowers for the Dead",
-    "The Great Show",
-    "The Lost Inscriptions",
-    "The Phantom Tablet",
-    "The Missing Performer",
-    "The Thirsty Merchant",
-    "The Impossible Ice",
-    "Frozen Catch",
-    "The Snowman",
-    "The Witch's Potion",
-    "The Lost Explorer",
-    "Ocean Cleanup",
-    "Sea Delivery",
-    "The Seven Seas Messenger",
-    "The Wheat Harvest",
-    "The Broken Mill",
-    "The Lost Key",
-    "The Prisoner's Letter",
-    "The Contraband",
-    "The Champion's Armor",
-    "The Rookie Gladiator",
-    "Message to the Skies",
-    "Celestial Feathers",
-    "The Hidden Clock",
-    "Shadow over Kraken's Rest",
-    "The Pawnbroker's Map",
-    "The VoidWalker's End",
-}
-
-GameClient.SECONDARY_QUEST_ISLANDS = {
-    ["The Runaway Cat"] = "Solmar Island",
-    ["The Sky Hermit"] = "Solmar Island",
-    ["Flowers for the Dead"] = "Forbidden Island",
-    ["The Great Show"] = "Circus Town",
-    ["The Lost Inscriptions"] = "Golden Dunes",
-    ["The Phantom Tablet"] = "Golden Dunes",
-    ["The Missing Performer"] = "Golden Dunes",
-    ["The Thirsty Merchant"] = "Golden Dunes",
-    ["The Impossible Ice"] = "Frost Island",
-    ["Frozen Catch"] = "Frost Island",
-    ["The Snowman"] = "Frost Island",
-    ["The Witch's Potion"] = "Forbidden Island",
-    ["The Lost Explorer"] = "Skull Island",
-    ["Ocean Cleanup"] = "Shark Park",
-    ["Sea Delivery"] = "Shark Park",
-    ["The Seven Seas Messenger"] = "Shark Park",
-    ["The Wheat Harvest"] = "Rustfall",
-    ["The Broken Mill"] = "Rustfall",
-    ["The Lost Key"] = "Prison",
-    ["The Prisoner's Letter"] = "Prison",
-    ["The Contraband"] = "Prison",
-    ["The Champion's Armor"] = "Valoria Island",
-    ["The Rookie Gladiator"] = "Valoria Island",
-    ["Message to the Skies"] = "Rustfall",
-    ["Celestial Feathers"] = "Windhaven",
-    ["The Hidden Clock"] = "Windhaven",
-    ["Shadow over Kraken's Rest"] = "Wandering Bastille",
-    ["The Pawnbroker's Map"] = "Harbor Island",
-    ["The VoidWalker's End"] = "Kraken's rest",
-}
+GameClient.SECONDARY_QUEST_GIVERS = {}
+GameClient.SECONDARY_QUEST_ORDER = {}
+GameClient.SECONDARY_QUEST_ISLANDS = {}
+for i, q in ipairs(GameClient.SECONDARY_QUESTS) do
+    GameClient.SECONDARY_QUEST_ORDER[i] = q[1]
+    if q[2] then GameClient.SECONDARY_QUEST_GIVERS[q[1]] = q[2] end
+    GameClient.SECONDARY_QUEST_ISLANDS[q[1]] = q[3]
+end
 
 GameClient.VoxQuestOrder = {
     Sense = {
@@ -6426,109 +6199,70 @@ local function resolveDirectObjectivePoint(obj)
     if oid:sub(1, 5) == "Talk_" then
         local npcId = oid:sub(6)
         local npcBase = npcId:gsub("_OTFinal$",""):gsub("_Harbor$",""):gsub("_SOL$",""):gsub("_GD$",""):gsub("_SP$",""):gsub("_SU$",""):gsub("_SL$",""):gsub("_VAL$",""):gsub("_WB$",""):gsub("_FI$",""):gsub("_PI$",""):gsub("_CT$",""):gsub("_SK$",""):gsub("_HI$",""):gsub("_FR$",""):gsub("_FS$",""):gsub("_OT$",""):gsub("_KR$",""):gsub("_HK$",""):gsub("_VO$",""):gsub("_NE$",""):gsub("_NA$",""):gsub("_MF$","")
-        local npcNameMap = {
+        GameClient._TalkNpcMap = GameClient._TalkNpcMap or {
             ChiefFestival = "VillageChief", ChiefSupplies = "VillageChief", ChiefNoTime = "VillageChief",
             ChiefPatrol = "VillageChief", ChiefVictory = "VillageChief", ChiefFestivalEnd = "VillageChief",
             ChiefTreasure = "VillageChief", VillageChief = "VillageChief", FestivalVillager = "VillageChief",
             MarineChief = "Marine Captain", MarineArrest = "MarineOfficer_Hideout",
             VascoClue = "Vasco", VascoNote = "Vasco_Hideout", VascoAfterFight = "Vasco_Hideout", VascoSafe = "Vasco_Hideout",
             SuppliesLady = "Supplies Lady", CryingGirl = "Crying Girl", BoatSeller = "Boat Seller",
-            WerewolfHunter = "Werewolf Hunter (Darius)",
-            OrangeTownMayor = "Orange Town Mayor",
-            OrangeTownResident = "Orange Town Resident",
-            OrangeTownTrainer = "Brutus (Treinador dos Piratas do Bugg)",
-            OldMarineChief = "OldMarineChief",
-            DemolitionSpecialist = "Demolition Specialist",
-            OldChiefFriend = "Old Explorer",
-            PrisonShipCaptain = "Prison Ship Captain",
-            InformantPrisoner = "Veteran Prisoner",
-            BlueHatGuard = "Blue Hat Guard", BlueHatGuard_1 = "Blue Hat Guard", BlueHatGuard_2 = "Blue Hat Guard",
-            CampWorker_1 = "Worker Hakim",
-            ResistanceScout = "Resistance Scout",
-            RevolutionLeader = "Revolution Leader",
-            Hassan = "Hassan", HassanQ4 = "Hassan", HassanToolsReturn = "Hassan",
-            MerchantKarim = "Karim",
-            HealerSamira = "Samira", SamiraWaterReturned = "Samira",
-            ExSoldierRashid = "Rashid", RashidAftermath = "Rashid",
-            ResistanceScribe = "Resistance Scribe",
-            RebelSignalman = "Rebel Signalman",
-            RebelPalaceRunner = "Rebel Palace Runner",
+            WerewolfHunter = "Werewolf Hunter (Darius)", OrangeTownMayor = "Orange Town Mayor",
+            OrangeTownResident = "Orange Town Resident", OrangeTownTrainer = "Brutus (Treinador dos Piratas do Bugg)",
+            OldMarineChief = "OldMarineChief", DemolitionSpecialist = "Demolition Specialist",
+            OldChiefFriend = "Old Explorer", PrisonShipCaptain = "Prison Ship Captain",
+            InformantPrisoner = "Veteran Prisoner", BlueHatGuard = "Blue Hat Guard", BlueHatGuard_1 = "Blue Hat Guard", BlueHatGuard_2 = "Blue Hat Guard",
+            CampWorker_1 = "Worker Hakim", ResistanceScout = "Resistance Scout", RevolutionLeader = "Revolution Leader",
+            Hassan = "Hassan", HassanQ4 = "Hassan", HassanToolsReturn = "Hassan", MerchantKarim = "Karim",
+            HealerSamira = "Samira", SamiraWaterReturned = "Samira", ExSoldierRashid = "Rashid", RashidAftermath = "Rashid",
+            ResistanceScribe = "Resistance Scribe", RebelSignalman = "Rebel Signalman", RebelPalaceRunner = "Rebel Palace Runner",
             SuspiciousMan = "Suspicious Man", SuspiciousBastille = "Suspicious Man", SuspiciousWake = "Suspicious Man",
-            ChefElixir = "Chef",
-            YoungResident = "Young Resident", YoungFarewell = "Young Resident",
-            ElderResident = "Elder Resident", ElderFarewell = "Elder Resident",
-            IslandResident = "Island Resident", IslandFarewell = "Island Resident",
-            ElixirVendor = "Elixir Vendor",
-            LighthouseMan = "Lighthouse Man",
-            Kaito = "Old Kaito",
+            ChefElixir = "Chef", YoungResident = "Young Resident", YoungFarewell = "Young Resident",
+            ElderResident = "Elder Resident", ElderFarewell = "Elder Resident", IslandResident = "Island Resident", IslandFarewell = "Island Resident",
+            ElixirVendor = "Elixir Vendor", LighthouseMan = "Lighthouse Man", Kaito = "Old Kaito",
             TaxFisherman = "Fisherman Toru", CrateReturn = "Fisherman Toru", TaxWarning = "Fisherman Toru",
-            FallenSharkman = "Fallen Sharkman",
-            GranlokMeeting = "Granlok", GranlokDefeated = "Fallen Granlok",
-            NarmerDefeated = "Defeated Narmer",
-            ColiseumClerk = "Coliseum Clerk",
-            RegistrarFound = "Coliseum Registrar",
-            MerchantSponsor = "Valoria Merchant",
-            MerchantSignature = "Valoria Merchant",
-            EntranceAttendant = "Coliseum Doorman",
+            FallenSharkman = "Fallen Sharkman", GranlokMeeting = "Granlok", GranlokDefeated = "Fallen Granlok",
+            NarmerDefeated = "Defeated Narmer", ColiseumClerk = "Coliseum Clerk", RegistrarFound = "Coliseum Registrar",
+            MerchantSponsor = "Valoria Merchant", MerchantSignature = "Valoria Merchant", EntranceAttendant = "Coliseum Doorman",
             ArenaGateTrial1 = "Arena Master", ArenaGateTrial2 = "Arena Master", ArenaGateFinal = "Arena Master",
             ArenaMasterQualified = "Arena Master", ArenaMasterFinalist = "Arena Master", ArenaMasterRelic = "Arena Master",
             ChampionIntro = "Valoria Champion", ChampionFinal = "Valoria Champion", ChampionFarewell = "Valoria Champion",
-            GateGuard = "Prison Gate Guard",
-            ScientistCell = "Aldous Venn", ScientistNautilia = "Aldous Venn",
+            GateGuard = "Prison Gate Guard", ScientistCell = "Aldous Venn", ScientistNautilia = "Aldous Venn",
             CommanderIntro = "Commander Grisval", CommanderDefeated = "Defeated Commander Grisval",
-            UpperCheckpoint = "Sergeant Halden", SergeantRuins = "Sergeant Halden",
-            LabRaidLeader = "Sergeant Halden", ArchiveSergeant = "Sergeant Halden",
-            SergeantDefeated = "Fallen Sergeant Halden",
+            UpperCheckpoint = "Sergeant Halden", SergeantRuins = "Sergeant Halden", LabRaidLeader = "Sergeant Halden",
+            ArchiveSergeant = "Sergeant Halden", SergeantDefeated = "Fallen Sergeant Halden",
             ResidentIntro = "Lower Resident", ResidentNote = "Lower Resident", ResidentWorks = "Lower Resident",
             ResidentStops = "Lower Resident", ResidentNautilia = "Lower Resident", ResidentScientist = "Lower Resident",
-            CensorWarning = "CensorWarning",
-            MechanicIntro = "Lower Mechanic", MechanicPower = "Lower Mechanic", MechanicDetention = "Lower Mechanic",
-            LabSealSergeant = "Upper Lab Sergeant",
-            GuardianMeeting = "Iron Lotus Master", GuardianDefeated = "Defeated Iron Lotus Master",
-            OfficerInterrogation = "Upper Officer",
-            CitadelGateGuard = "Citadel Gate Guard",
-            CargoForeman = "Cargo Foreman",
-            CitadelInspector = "Citadel Inspector",
-            MessengerSummons = "Upper Messenger",
-            CommanderSummons = "Commander Daskel", CommanderRelease = "Commander Daskel",
-            AldousDamagedKey = "Aldous Venn_SU", AldousNeruvia = "Aldous Venn_NE", AldousHallDoor = "Aldous Venn_NE",
-            ForgeSmiths = "Bram Hollowell_VO", KaeldrosAccepts = "Defeated Kaeldros_VO", KaeldrosReforge = "Kaeldros_VO",
-            LunaelArrival = "Lunael_Arrival_NA", LunaelDeal = "Lunael_NA", LunaelAutomatons = "Lunael_NA",
-            LunaelMetal = "Lunael_NA", LunaelSuspect = "Lunael_NA", LunaelDetector = "Lunael_NA",
-            LunaelHugo = "Lunael_NA", LunaelPromise = "Lunael_NA", AssistantRepair = "Repair Assistant_NA",
-            AssistantGears = "Repair Assistant_NA", RepairWorker = "Repair Worker_NA", HugoCaptive = "Hugo_NA",
-            RecruiterEnlist = "Marine Recruiter_MF", RecruiterCourse = "Marine Recruiter_MF",
+            CensorWarning = "CensorWarning", MechanicIntro = "Lower Mechanic", MechanicPower = "Lower Mechanic", MechanicDetention = "Lower Mechanic",
+            LabSealSergeant = "Upper Lab Sergeant", GuardianMeeting = "Iron Lotus Master", GuardianDefeated = "Defeated Iron Lotus Master",
+            OfficerInterrogation = "Upper Officer", CitadelGateGuard = "Citadel Gate Guard", CargoForeman = "Cargo Foreman",
+            CitadelInspector = "Citadel Inspector", MessengerSummons = "Upper Messenger", CommanderSummons = "Commander Daskel",
+            CommanderRelease = "Commander Daskel", AldousDamagedKey = "Aldous Venn_SU", AldousNeruvia = "Aldous Venn_NE",
+            AldousHallDoor = "Aldous Venn_NE", ForgeSmiths = "Bram Hollowell_VO", KaeldrosAccepts = "Defeated Kaeldros_VO",
+            KaeldrosReforge = "Kaeldros_VO", LunaelArrival = "Lunael_Arrival_NA", LunaelDeal = "Lunael_NA",
+            LunaelAutomatons = "Lunael_NA", LunaelMetal = "Lunael_NA", LunaelSuspect = "Lunael_NA",
+            LunaelDetector = "Lunael_NA", LunaelHugo = "Lunael_NA", LunaelPromise = "Lunael_NA",
+            AssistantRepair = "Repair Assistant_NA", AssistantGears = "Repair Assistant_NA", RepairWorker = "Repair Worker_NA",
+            HugoCaptive = "Hugo_NA", RecruiterEnlist = "Marine Recruiter_MF", RecruiterCourse = "Marine Recruiter_MF",
         }
-        local mapped = npcNameMap[npcBase]
+        local mapped = GameClient._TalkNpcMap[npcBase]
         if not mapped then
             local stripped = npcBase:gsub("_[A-Za-z0-9]+$", "")
-            mapped = npcNameMap[stripped]
+            mapped = GameClient._TalkNpcMap[stripped]
             if not mapped then
-                local prefixMap = {
-                    { "^LighthouseMan", "Lighthouse Man" },
-                    { "^Kaito", "Old Kaito" },
-                    { "^Leader", "Revolution Leader" },
-                    { "^RevolutionLeader", "Revolution Leader" },
-                    { "^BlueHat", "Blue Hat Guard" },
-                    { "^Aldous", "Aldous Venn_SU" },
-                    { "^Archivist", "Upper Archivist" },
-                    { "^Raikan", "Raikan" },
-                    { "^DepotClerk", "Depot Clerk" },
-                    { "^ArenaMaster", "Arena Master" },
-                    { "^ArenaGate", "Arena Master" },
-                    { "^Champion", "Valoria Champion" },
-                    { "^ColiseumClerk", "Coliseum Clerk" },
-                    { "^EntranceAttendant", "Coliseum Doorman" },
-                    { "^Registrar", "Coliseum Registrar" },
-                    { "^Scientist", "Aldous Venn" },
-                    { "^GateGuard", "Prison Gate Guard" },
-                    { "^Commander", "Commander Daskel" },
-                    { "^Messenger", "Upper Messenger" },
-                    { "^Resident", "Lower Resident" },
-                    { "^Mechanic", "Lower Mechanic" },
-                    { "^Askard", "Askard" },
+                GameClient._TalkPrefixMap = GameClient._TalkPrefixMap or {
+                    { "^LighthouseMan", "Lighthouse Man" }, { "^Kaito", "Old Kaito" },
+                    { "^Leader", "Revolution Leader" }, { "^RevolutionLeader", "Revolution Leader" },
+                    { "^BlueHat", "Blue Hat Guard" }, { "^Aldous", "Aldous Venn_SU" },
+                    { "^Archivist", "Upper Archivist" }, { "^Raikan", "Raikan" },
+                    { "^DepotClerk", "Depot Clerk" }, { "^ArenaMaster", "Arena Master" },
+                    { "^ArenaGate", "Arena Master" }, { "^Champion", "Valoria Champion" },
+                    { "^ColiseumClerk", "Coliseum Clerk" }, { "^EntranceAttendant", "Coliseum Doorman" },
+                    { "^Registrar", "Coliseum Registrar" }, { "^Scientist", "Aldous Venn" },
+                    { "^GateGuard", "Prison Gate Guard" }, { "^Commander", "Commander Daskel" },
+                    { "^Messenger", "Upper Messenger" }, { "^Resident", "Lower Resident" },
+                    { "^Mechanic", "Lower Mechanic" }, { "^Askard", "Askard" },
                 }
-                for _, pm in ipairs(prefixMap) do
+                for _, pm in ipairs(GameClient._TalkPrefixMap) do
                     if npcBase:match(pm[1]) then
                         mapped = pm[2]
                         break
@@ -7174,7 +6908,7 @@ Movement.TryMirrorKeeperTravel = function(destPos, targetIslandName, abortIf)
     if keeperDist > 6 then
         task.spawn(function() pcall(function() LP:RequestStreamAroundAsync(kPos) end) end)
         local tTw = os.clock()
-        tweenTo(CFrame.lookAt(kPos + Vector3.new(0, 2, 3), kPos), abortIf)
+        tweenTo(GameClient.GetNpcFrontCFrame(keeperName, kPos, 3), abortIf)
         debugLog("mirror_debug.txt", ("TWEEN_KEEPER done in %.1fs"):format(os.clock() - tTw))
         if isDeadOrRespawning() or (abortIf and abortIf()) then
             debugLog("mirror_debug.txt", ("ABORT: %s durante tween até keeper %s"):format(isDeadOrRespawning() and "morreu" or "abortado", keeperName))
@@ -7190,7 +6924,7 @@ Movement.TryMirrorKeeperTravel = function(destPos, targetIslandName, abortIf)
     end
     local distToKeeper = (hrpNow.Position - kPos).Magnitude
     if distToKeeper > 8 and distToKeeper <= 80 then
-        tweenTo(CFrame.lookAt(kPos + Vector3.new(0, 2, 2), kPos), abortIf)
+        tweenTo(GameClient.GetNpcFrontCFrame(keeperName, kPos, 2), abortIf)
         if isDeadOrRespawning() or (abortIf and abortIf()) then
             debugLog("mirror_debug.txt", ("ABORT: %s no ajuste fino até keeper %s"):format(isDeadOrRespawning() and "morreu" or "abortado", keeperName))
             return false
@@ -7213,21 +6947,25 @@ Movement.TryMirrorKeeperTravel = function(destPos, targetIslandName, abortIf)
         if attempt == 2 then
             local _, hRetry = getChar()
             if hRetry and (hRetry.Position - kPos).Magnitude > maxKeeperRange then
-                tweenTo(getKeeperFrontCFrame(2), abortIf)
+                tweenTo(GameClient.GetNpcFrontCFrame(keeperName, kPos, 2), abortIf)
                 cancelTween()
                 if isDeadOrRespawning() or (abortIf and abortIf()) then return false end
             end
             debugLog("mirror_debug.txt", ("RETRY: reenviando Travel para %s via %s"):format(targetArea.Name, keeperName))
         end
         debugLog("mirror_debug.txt", ("ATTEMPT_%d: send Travel"):format(attempt))
-        local ni = ReplicatedStorage:FindFirstChild("NetworkInstances")
-        local re = ni and ni:FindFirstChild("RemoteEvents")
-        local ev = re and re:FindFirstChild("Elysium_Converse")
-        if ev then
-            ev:FireServer("Mirror Keeper", "Travel", targetArea.Name)
+        local dlg = GameClient.GetDialogueClient and GameClient.GetDialogueClient()
+        if dlg and type(dlg.GetBlockReason) == "function" then
+            local okBlk, blkReason = pcall(dlg.GetBlockReason, "Mirror Keeper")
+            if okBlk and blkReason then
+                debugLog("mirror_debug.txt", ("DIALOGUE_BLOCKED reason=%s"):format(tostring(blkReason)))
+            end
+        end
+        local okTravel, errTravel = GameClient.Converse("Mirror Keeper", "Travel", targetArea.Name)
+        if okTravel then
             debugLog("mirror_debug.txt", ("ATTEMPT_%d: Travel sent -> %s"):format(attempt, tostring(targetArea.Name)))
         else
-            GameClient.FireServerLogged("mirror_debug.txt", "MirrorKeeper:Travel:" .. tostring(targetArea.Name), "Elysium_Converse", "Mirror Keeper", "Travel", targetArea.Name)
+            debugLog("mirror_debug.txt", ("ATTEMPT_%d: Travel failed -> %s (%s)"):format(attempt, tostring(targetArea.Name), tostring(errTravel)))
         end
 
         local tWait = os.clock() + (attempt == 1 and 2.0 or 2.5)
@@ -7348,7 +7086,7 @@ function BoatSystem.BuyBoatIfNeeded(aborted)
         Status = "Barco: comprando Boat..."
         tweenTo(CFrame.new(shopPos + Vector3.new(0, 2, 3)), aborted)
         task.wait(0.25)
-        pcall(function() GameModules.Network:FireServer("Elysium_Converse", "Solmar Shipwright") end)
+        GameClient.Converse("Solmar Shipwright")
         task.wait(0.4)
         pcall(function() GameModules.Network:FireServer("ShopSystem", "Purchase", 2, 1) end)
         task.wait(0.4)
@@ -8035,25 +7773,25 @@ local function storyLoop(mode)
                             usedVoxOffer = true
                             logSec("VOX_OFFER action=AcceptMastery ability=Busoshoku")
                             pcall(function()
-                                GameModules.Network:FireServer("Elysium_Converse", "Askard", "AcceptMastery", "Busoshoku")
+                                GameClient.Converse("Askard", "AcceptMastery", "Busoshoku")
                             end)
                         elseif nextName == "Vox Sense Mastery" then
                             usedVoxOffer = true
                             logSec("VOX_OFFER action=AcceptMastery ability=Kenbushoku")
                             pcall(function()
-                                GameModules.Network:FireServer("Elysium_Converse", "Askard", "AcceptMastery", "Kenbushoku")
+                                GameClient.Converse("Askard", "AcceptMastery", "Kenbushoku")
                             end)
                         elseif nextName == "Vox Armor Training" then
                             usedVoxOffer = true
                             logSec("VOX_OFFER action=AcceptArmor")
                             pcall(function()
-                                GameModules.Network:FireServer("Elysium_Converse", "Askard", "AcceptArmor")
+                                GameClient.Converse("Askard", "AcceptArmor")
                             end)
                         elseif nextName == "Vox Sense Training" then
                             usedVoxOffer = true
                             logSec("VOX_OFFER action=AcceptSense")
                             pcall(function()
-                                GameModules.Network:FireServer("Elysium_Converse", "Askard", "AcceptSense")
+                                GameClient.Converse("Askard", "AcceptSense")
                             end)
                         end
                     end
@@ -8263,7 +8001,7 @@ local function storyLoop(mode)
                             if not (hAfterP and ((hAfterP.Position.Y > -200 and npcPos.Y < -200) or (hAfterP.Position.Y < -200 and npcPos.Y > -200))) then
                                 GameClient.talkToNPC("", npcPos, aborted)
                                 if isSec and nextName == "The Champion's Armor" then
-                                    pcall(function() GameModules.Network:FireServer("Elysium_Converse", "ValoriaBlacksmith", "AcceptArmor") end)
+                                    GameClient.Converse("ValoriaBlacksmith", "AcceptArmor")
                                     task.wait(0.4)
                                 end
                             end
@@ -8936,7 +8674,7 @@ local function storyLoop(mode)
                                     tweenTo(CFrame.new(shopPos + Vector3.new(0, 2, 3)), aborted)
                                     task.wait(0.25)
                                 end
-                                pcall(function() GameModules.Network:FireServer("Elysium_Converse", shopNpc) end)
+                                GameClient.Converse(shopNpc)
                                 task.wait(0.5)
                                 pcall(function() GameModules.Network:FireServer("ShopSystem", "Purchase", itemIdx, 1) end)
                                 task.wait(0.5)
@@ -9072,14 +8810,14 @@ local function storyLoop(mode)
                                     tweenTo(CFrame.new(talkPos + Vector3.new(0, 2, 3)), aborted)
                                     task.wait(0.2)
                                 end
-                                pcall(function() GameModules.Network:FireServer("Elysium_Converse", "ValoriaBlacksmith", "DeliverArmor") end)
+                                GameClient.Converse("ValoriaBlacksmith", "DeliverArmor")
                                 task.wait(0.6)
                             elseif oid == "Talk_TomatoClownReward_SQ" then
                                 local talkPos = giverPos("Tomato Clown") or pos
                                 if talkPos then
                                     GameClient.talkToNPC("Tomato Clown", talkPos, aborted)
                                 end
-                                pcall(function() GameModules.Network:FireServer("Elysium_Converse", "TomatoClown", "Reward") end)
+                                GameClient.Converse("TomatoClown", "Reward")
                                 task.wait(0.6)
                             elseif oid == "Talk_OrangeTownTrainer_Treasure" and LP.Character and LP.Character:GetAttribute("CarriedChest") == nil then
                                 -- Se ainda não está segurando o baú: se existe baú no chão (IgnoreList.Int.Chests), pega com "Carry Chest"; senão escava em "Find_TreasureX"
@@ -9108,7 +8846,7 @@ local function storyLoop(mode)
                                 end
                                 if oid == "Pay_EntryFee_VAL" or oid == "Pay_RegistrarBribe_VAL" then
                                     local act = (oid == "Pay_EntryFee_VAL") and "Register" or "Bribe"
-                                    pcall(function() GameModules.Network:SafeInvokeServer(5, "Elysium_Converse", "ColiseumRegistrar", act) end)
+                                    GameClient.InvokeConverse(5, "ColiseumRegistrar", act)
                                     task.wait(0.5)
                                 end
                                 if GameClient.isObjActive(nil, oid) and not aborted() then
@@ -9119,7 +8857,7 @@ local function storyLoop(mode)
                                     end
                                     if (oid == "Talk_MerchantSponsor_VAL" or oid == "Talk_MerchantSignature_VAL")
                                         and GameClient.isObjActive(nil, oid) and not aborted() then
-                                        pcall(function() GameModules.Network:FireServer("Elysium_Converse", "ValoriaMerchant") end)
+                                        GameClient.Converse("ValoriaMerchant")
                                         task.wait(0.4)
                                     end
                                     task.wait(0.3)
@@ -9235,7 +8973,7 @@ local function storyLoop(mode)
                             GameClient.drainConverseUI(aborted, 15)
                             -- Also fire Converse directly for notes/items that complete via Converse:FireServer()
                             local convName = oid:gsub("^Collect_", "")
-                            pcall(function() GameModules.Network:FireServer("Elysium_Converse", convName) end)
+                            GameClient.Converse(convName)
                             task.wait(0.4)
 
                         elseif oid == "Escort_Brother" then
@@ -9876,7 +9614,7 @@ local function storyLoop(mode)
                             if talkPos then
                                 GameClient.talkToNPC("Tomato Clown", talkPos, aborted)
                             end
-                            pcall(function() GameModules.Network:FireServer("Elysium_Converse", "TomatoClown", "StartShow") end)
+                            GameClient.Converse("TomatoClown", "StartShow")
                             task.wait(0.6)
 
                         elseif oid:sub(1, 6) == "Learn_" or oid == "Dodge_Stones_HK" or oid == "Dodge_Blindfold_HK" or oid == "Spar_Askard_HK" or oid == "Train_VoxSense_VX" then
@@ -10006,46 +9744,6 @@ local function storyLoop(mode)
                                     task.wait(0.2)
                                 end
                             end
-                        elseif oid == "Race_BastionRings_MF" then
-                            local ringsFolder = nil
-                            pcall(function()
-                                local area = MainModules and MainModules.AreaAssets and MainModules.AreaAssets.Area("MarineFord", 5)
-                                ringsFolder = area and area:FindFirstChild("RecruitRings_MF")
-                                if not ringsFolder then
-                                    local map = workspace:FindFirstChild("Map")
-                                    local areas = map and map:FindFirstChild("Areas")
-                                    local mf = areas and areas:FindFirstChild("MarineFord")
-                                    ringsFolder = mf and mf:FindFirstChild("RecruitRings_MF", true)
-                                end
-                            end)
-                            local function findBastionRing(idx)
-                                if not ringsFolder then return nil end
-                                local byNumber = {}
-                                for _, ch in ipairs(ringsFolder:GetChildren()) do
-                                    local n = tonumber(string.match(ch.Name, "%d+$"))
-                                    if n then byNumber[n] = ch end
-                                end
-                                return byNumber[idx] or byNumber[((idx - 1) % 6) + 1]
-                                    or ringsFolder:FindFirstChild("Ring_" .. idx)
-                                    or ringsFolder:FindFirstChild(tostring(idx))
-                            end
-                            local function ringRemainingMF()
-                                local qp = GameClient.getQuestClientProgress()
-                                local val = qp and qp.ObjectiveIds and qp.ObjectiveIds["Race_BastionRings_MF"]
-                                return type(val) == "number" and val or 0
-                            end
-                            while not aborted() and GameClient.isObjActive(nil, "Race_BastionRings_MF") do
-                                local rem = ringRemainingMF()
-                                if rem <= 0 then break end
-                                local nextIdx = math.clamp(13 - rem, 1, 12)
-                                local ringInst = findBastionRing(nextIdx)
-                                local rPos = ringInst and (ringInst:IsA("BasePart") and ringInst.Position or ringInst:GetPivot().Position)
-                                if rPos then
-                                    Status = ("História: anel %d/12..."):format(nextIdx)
-                                    local _, hrp0 = getChar()
-                                    local fromPos = hrp0 and hrp0.Position or (rPos - Vector3.new(0, 0, 8))
-                                    local flatDir = Vector3.new(rPos.X - fromPos.X, 0, rPos.Z - fromPos.Z)
-                                    local nextInst = nextIdx < 12 and findBastionRing(nextIdx + 1)
                         elseif oid == "Race_BastionRings_MF" then
                             local ringsFolder = nil
                             pcall(function()
@@ -10327,8 +10025,6 @@ local function storyLoop(mode)
                 end
             end
             task.wait(0.25)
-        end
-        end
         end
         end, function(err)
             logSec("STORY_ERR: " .. tostring(err))
@@ -10946,13 +10642,15 @@ function GameClient.IslandBossLoop()
                                 Status = ("Boss Ilha: indo até %s..."):format(chosen)
                                 goNear(dest, function() return actAborted() or findWorldBoss(chosen) ~= nil end)
                                 if chosen == "VoidWalker Mordrek" and CFG.UseVoidWalkerKey and hasVoidWalkerKey() and not actAborted() and not findWorldBoss(chosen) then
-                                    task.wait(1)
-                                    local ni = ReplicatedStorage:FindFirstChild("NetworkInstances")
-                                    local re = ni and ni:FindFirstChild("RemoteEvents")
-                                    local ev = re and re:FindFirstChild("Elysium_Converse")
-                                    if ev then
+                                    local _, hrpVoid = getChar()
+                                    if hrpVoid and (hrpVoid.Position - dest).Magnitude <= 80 then
+                                        local frontCF = GameClient.GetNpcFrontCFrame("Void Herald", dest, 3)
+                                        if frontCF then tweenTo(frontCF, actAborted) end
+                                    end
+                                    if not actAborted() and not findWorldBoss(chosen) then
+                                        task.wait(1)
                                         debugLog("island_boss_debug.txt", "SUMMON_VOIDWALKER Elysium_Converse('Void Herald', 'Summon')")
-                                        ev:FireServer("Void Herald", "Summon")
+                                        GameClient.Converse("Void Herald", "Summon")
                                     end
                                 end
                                 local waitUntil = os.clock() + ((chosen == "VoidWalker Mordrek" and CFG.UseVoidWalkerKey) and 4.0 or 1.5)
@@ -12102,7 +11800,7 @@ function GameClient.EnsureBankOpen(aborted, logBank)
             retriedConverse = true
             logBank("BANK_OPEN_RETRY_CONVERSE")
             if Movement.BeginInteract and not Movement.BeginInteract(aborted) then return false, "aborted" end
-            pcall(function() GameModules.Network:FireServer("Elysium_Converse", "Banker") end)
+            GameClient.Converse("Banker")
             task.wait(0.25)
             pcall(menu.RequestOpen)
         end
@@ -12726,7 +12424,6 @@ GameClient.MISSIONS_BY_NAME = State.Mobs.MissionsByName
 GameClient.TravelUtils = MainModules and MainModules.TravelUtils
 GameClient.ToolsInfo = MainModules and MainModules.ToolsInfo
 GameClient.TravelToPos = goNear
-GameClient.TravelToMirror = Movement.TryMirrorKeeperTravel
 GameClient.CancelTravel = cancelTween
 GameClient.LogTravel = function(msg, reset)
     debugLog("travel_debug.txt", msg, reset)
@@ -13087,6 +12784,10 @@ Features.MissionLoop = function()
                                     shouldContinue = true
                                 end
                             end
+                        elseif GameClient.TryNativeRepeatQuest(missionEntry.name) then
+                            Status = "Repetindo missão..."
+                            task.wait(0.35)
+                            shouldContinue = true
                         elseif os.clock() >= State.questCooldown then
                             logMob(("ACCEPT_QUEST mission=%s"):format(missionEntry.name))
                             if Features.TryAcceptQuest(missionEntry.name, missionEntry.info, mAborted) then
@@ -15029,7 +14730,7 @@ function Features.InitKeyCraft()
                         dialogue:FireServer()
                     end
                     if attempt >= 2 and GameModules.Network then
-                        GameModules.Network:FireServer("Elysium_Converse", convName)
+                        GameClient.Converse(convName)
                     end
                 end)
                 local openDeadline = os.clock() + 2.5
@@ -15140,6 +14841,50 @@ function Features.InitKeyCraft()
         return forgeItemAtBlacksmith(itemName, req.Unique and 1 or math.max(1, math.floor(targetQty or 1)), req.Level, aborted, logFn)
     end
 
+    local function runCraftTargetLoop(opts)
+        local myTok = opts.Token
+        local logFn = opts.LogFn
+        local aborted = opts.Aborted
+        SafeRuntime.RunResilientLoop(opts.LoopName, function() return not aborted() end, function()
+        while not aborted() do
+            local curCnt = (MainModules and MainModules.ToolsUtils and MainModules.ToolsUtils.GetInventoryAmount(nil, opts.ItemName)) or 0
+            if curCnt >= opts.GoalCnt then
+                logFn(("DONE %s crafted=%d cur=%d"):format(tostring(opts.ItemName), curCnt - opts.StartCnt, curCnt))
+                notify(opts.Title, ("Craft concluído: %dx %s"):format(opts.WantQty, tostring(opts.ItemName)))
+                break
+            end
+            local remCrafts = opts.Unique and 1 or math.max(1, math.ceil((opts.GoalCnt - curCnt) / opts.OutPerCraft))
+            local okStep, reason = craftItemRecursiveStep(opts.ItemName, remCrafts, aborted, logFn, {})
+            if opts.OnUIUpdate then pcall(opts.OnUIUpdate) end
+            curCnt = (MainModules and MainModules.ToolsUtils and MainModules.ToolsUtils.GetInventoryAmount(nil, opts.ItemName)) or 0
+            logFn(("TICK cur=%d/%d remCrafts=%d ok=%s reason=%s"):format(curCnt, opts.GoalCnt, remCrafts, tostring(okStep), tostring(reason)))
+            if curCnt >= opts.GoalCnt then
+                logFn(("DONE %s crafted=%d cur=%d"):format(tostring(opts.ItemName), curCnt - opts.StartCnt, curCnt))
+                notify(opts.Title, ("Craft concluído: %dx %s"):format(opts.WantQty, tostring(opts.ItemName)))
+                break
+            end
+            if not okStep then
+                if reason ~= "aborted" then
+                    logFn(("FAIL reason=%s"):format(tostring(reason)))
+                    Status = opts.Title .. ": " .. tostring(reason)
+                    notify(opts.Title, tostring(reason))
+                end
+                break
+            end
+            task.wait(0.25)
+        end
+        end, function(err) cancelTween() end)
+        if State.Tokens[opts.TokenKey] == myTok then
+            State.activeFarmQuestName = nil
+            CFG[opts.CfgFlag] = false
+            if Shared.RefreshToggles then Shared.RefreshToggles() end
+            if opts.OnUIUpdate then pcall(opts.OnUIUpdate) end
+            logFn(("TOGGLE_SYNC val=%s"):format(tostring(Toggles and Toggles[opts.ToggleKey] and Toggles[opts.ToggleKey].Value)))
+            logFn("=== " .. opts.StopLabel .. " STOP ===")
+            Status = "Parado"
+        end
+    end
+
     function GameClient.StopStandaloneKeyCraft()
         debugLog("keycraft_debug.txt", "STOP_REQUEST user=true")
         State.activeFarmQuestName = nil
@@ -15151,9 +14896,7 @@ function Features.InitKeyCraft()
         local myTok = State.Tokens.KeyCraft
         task.spawn(function()
             local function logKey(msg) debugLog("keycraft_debug.txt", msg) end
-            local function aborted()
-                return not CFG.AutoCraftRaidKey or CFG.AutoRaid or State.Tokens.KeyCraft ~= myTok
-            end
+            local function aborted() return not CFG.AutoCraftRaidKey or CFG.AutoRaid or State.Tokens.KeyCraft ~= myTok end
             local bossName, diff = CFG.CraftKeyBoss, CFG.CraftKeyDiff
             local wantQty = math.clamp(math.floor(tonumber(CFG.CraftKeyAmount) or 1), 1, 99)
             debugLog("keycraft_debug.txt", ("=== KEY_CRAFT START boss=%s diff=%s wantQty=%d lv=%d ==="):format(tostring(bossName), tostring(diff), wantQty, getLevel()), true)
@@ -15178,44 +14921,12 @@ function Features.InitKeyCraft()
             local outPerCraft = math.max(1, tonumber(baseReq and baseReq.OutputAmount) or 1)
             local goalCnt = startCnt + wantQty * outPerCraft
             logKey(("GOAL key=%s startCnt=%d outPerCraft=%d wantQty=%d goalCnt=%d"):format(tostring(entry.Name), startCnt, outPerCraft, wantQty, goalCnt))
-            SafeRuntime.RunResilientLoop("KeyCraftLoop", function() return not aborted() end, function()
-            while not aborted() do
-                local curCnt = (MainModules and MainModules.ToolsUtils and MainModules.ToolsUtils.GetInventoryAmount(nil, entry.Name)) or 0
-                if curCnt >= goalCnt then
-                    logKey(("DONE key=%s crafted=%d cur=%d"):format(tostring(entry.Name), curCnt - startCnt, curCnt))
-                    notify("Craft Key", ("Craft concluído: %dx %s"):format(wantQty, tostring(entry.Name)))
-                    break
-                end
-                local remCrafts = math.max(1, math.ceil((goalCnt - curCnt) / outPerCraft))
-                local okStep, reason = craftItemRecursiveStep(entry.Name, remCrafts, aborted, logKey, {})
-                if GameClient.OnCraftKeyUIUpdate then pcall(GameClient.OnCraftKeyUIUpdate) end
-                curCnt = (MainModules and MainModules.ToolsUtils and MainModules.ToolsUtils.GetInventoryAmount(nil, entry.Name)) or 0
-                logKey(("TICK cur=%d/%d remCrafts=%d ok=%s reason=%s"):format(curCnt, goalCnt, remCrafts, tostring(okStep), tostring(reason)))
-                if curCnt >= goalCnt then
-                    logKey(("DONE key=%s crafted=%d cur=%d"):format(tostring(entry.Name), curCnt - startCnt, curCnt))
-                    notify("Craft Key", ("Craft concluído: %dx %s"):format(wantQty, tostring(entry.Name)))
-                    break
-                end
-                if not okStep then
-                    if reason ~= "aborted" then
-                        logKey(("FAIL reason=%s"):format(tostring(reason)))
-                        Status = "Craft Key: " .. tostring(reason)
-                        notify("Craft Key", tostring(reason))
-                    end
-                    break
-                end
-                task.wait(0.25)
-            end
-            end, function(err) cancelTween() end)
-            if State.Tokens.KeyCraft == myTok then
-                State.activeFarmQuestName = nil
-                CFG.AutoCraftRaidKey = false
-                if Shared.RefreshToggles then Shared.RefreshToggles() end
-                if GameClient.OnCraftKeyUIUpdate then pcall(GameClient.OnCraftKeyUIUpdate) end
-                logKey(("TOGGLE_SYNC val=%s"):format(tostring(Toggles and Toggles.AutoCraftRaidKeyActive and Toggles.AutoCraftRaidKeyActive.Value)))
-                logKey("=== KEY_CRAFT STOP ===")
-                Status = "Parado"
-            end
+            runCraftTargetLoop({
+                LoopName = "KeyCraftLoop", Title = "Craft Key", StopLabel = "KEY_CRAFT",
+                Token = myTok, TokenKey = "KeyCraft", CfgFlag = "AutoCraftRaidKey", ToggleKey = "AutoCraftRaidKeyActive",
+                ItemName = entry.Name, WantQty = wantQty, StartCnt = startCnt, OutPerCraft = outPerCraft, GoalCnt = goalCnt,
+                Unique = false, LogFn = logKey, Aborted = aborted, OnUIUpdate = GameClient.OnCraftKeyUIUpdate,
+            })
         end)
     end
 
@@ -15231,9 +14942,7 @@ function Features.InitKeyCraft()
         local myTok = State.Tokens.Blacksmith
         task.spawn(function()
             local function logBS(msg) debugLog("blacksmith_debug.txt", msg) end
-            local function aborted()
-                return not CFG.AutoBlacksmith or State.Tokens.Blacksmith ~= myTok
-            end
+            local function aborted() return not CFG.AutoBlacksmith or State.Tokens.Blacksmith ~= myTok end
             local itemName = CFG.BlacksmithTarget
             debugLog("blacksmith_debug.txt", ("=== BLACKSMITH START item=%s amount=%s lv=%d ==="):format(tostring(itemName), tostring(CFG.BlacksmithAmount), getLevel()), true)
             local baseReq = itemName and getItemRequirements(itemName, 1)
@@ -15251,45 +14960,12 @@ function Features.InitKeyCraft()
             logBS(("GOAL item=%s unique=%s startCnt=%d outPerCraft=%d wantQty=%d goalCnt=%d forgeLv=%d gold=%d"):format(
                 tostring(itemName), tostring(baseReq.Unique), startCnt, outPerCraft, wantQty, goalCnt, tonumber(baseReq.Level) or 0, tonumber(baseReq.Gold) or 0
             ))
-
-            SafeRuntime.RunResilientLoop("BlacksmithLoop", function() return not aborted() end, function()
-            while not aborted() do
-                local curCnt = (MainModules and MainModules.ToolsUtils and MainModules.ToolsUtils.GetInventoryAmount(nil, itemName)) or 0
-                if curCnt >= goalCnt then
-                    logBS(("DONE item=%s crafted=%d cur=%d"):format(tostring(itemName), curCnt - startCnt, curCnt))
-                    notify("Blacksmith", ("Craft concluído: %dx %s"):format(wantQty, tostring(itemName)))
-                    break
-                end
-                local remCrafts = baseReq.Unique and 1 or math.max(1, math.ceil((goalCnt - curCnt) / outPerCraft))
-                local okStep, reason = craftItemRecursiveStep(itemName, remCrafts, aborted, logBS, {})
-                if GameClient.OnBlacksmithUIUpdate then pcall(GameClient.OnBlacksmithUIUpdate) end
-                curCnt = (MainModules and MainModules.ToolsUtils and MainModules.ToolsUtils.GetInventoryAmount(nil, itemName)) or 0
-                logBS(("TICK cur=%d/%d remCrafts=%d ok=%s reason=%s"):format(curCnt, goalCnt, remCrafts, tostring(okStep), tostring(reason)))
-                if curCnt >= goalCnt then
-                    logBS(("DONE item=%s crafted=%d cur=%d"):format(tostring(itemName), curCnt - startCnt, curCnt))
-                    notify("Blacksmith", ("Craft concluído: %dx %s"):format(wantQty, tostring(itemName)))
-                    break
-                end
-                if not okStep then
-                    if reason ~= "aborted" then
-                        logBS(("FAIL reason=%s"):format(tostring(reason)))
-                        Status = "Blacksmith: " .. tostring(reason)
-                        notify("Blacksmith", tostring(reason))
-                    end
-                    break
-                end
-                task.wait(0.25)
-            end
-            end, function(err) cancelTween() end)
-            if State.Tokens.Blacksmith == myTok then
-                State.activeFarmQuestName = nil
-                CFG.AutoBlacksmith = false
-                if Shared.RefreshToggles then Shared.RefreshToggles() end
-                if GameClient.OnBlacksmithUIUpdate then pcall(GameClient.OnBlacksmithUIUpdate) end
-                logBS(("TOGGLE_SYNC val=%s"):format(tostring(Toggles and Toggles.BlacksmithCraftActive and Toggles.BlacksmithCraftActive.Value)))
-                logBS("=== BLACKSMITH STOP ===")
-                Status = "Parado"
-            end
+            runCraftTargetLoop({
+                LoopName = "BlacksmithLoop", Title = "Blacksmith", StopLabel = "BLACKSMITH",
+                Token = myTok, TokenKey = "Blacksmith", CfgFlag = "AutoBlacksmith", ToggleKey = "BlacksmithCraftActive",
+                ItemName = itemName, WantQty = wantQty, StartCnt = startCnt, OutPerCraft = outPerCraft, GoalCnt = goalCnt,
+                Unique = baseReq.Unique, LogFn = logBS, Aborted = aborted, OnUIUpdate = GameClient.OnBlacksmithUIUpdate,
+            })
         end)
     end
 
@@ -15719,7 +15395,8 @@ do
             return false
         end
         task.spawn(function()
-            local dest = pt.CFrame.Position + Vector3.new(0, 2, 3)
+            local gcf = (bm.GetGroundCFrame and bm.GetGroundCFrame(pt)) or pt.CFrame
+            local dest = gcf.Position + gcf.LookVector * 3 + Vector3.new(0, 2, 0)
             Status = "Indo ao Black Market..."
             goNear(dest, function() return isDeadOrRespawning() end)
             Status = "Parado"
@@ -15775,12 +15452,14 @@ do
                         if #buyPlan > 0 then
                             local snap = Features.PauseForInterrupt and Features.PauseForInterrupt() or nil
                             pcall(function()
-                                local dest = pt.CFrame.Position + Vector3.new(0, 2, 3)
+                                local gcf = (bm.GetGroundCFrame and bm.GetGroundCFrame(pt)) or pt.CFrame
+                                local dest = gcf.Position + gcf.LookVector * 3 + Vector3.new(0, 2, 0)
+                                local buyDist = math.max(12, (tonumber(bm.BuyDistance) or 35) - 5)
                                 Status = "Black Market: indo comprar..."
                                 goNear(dest, function() return not CFG.AutoBlackMarket or State.Tokens.BlackMarket ~= myTok end)
                                 local _, hrpNow = getChar()
-                                if hrpNow and (hrpNow.Position - dest).Magnitude > 25 then
-                                    tweenTo(CFrame.new(dest), function() return not CFG.AutoBlackMarket or State.Tokens.BlackMarket ~= myTok end)
+                                if hrpNow and (hrpNow.Position - dest).Magnitude > buyDist then
+                                    tweenTo(CFrame.lookAt(dest, gcf.Position), function() return not CFG.AutoBlackMarket or State.Tokens.BlackMarket ~= myTok end)
                                     cancelTween()
                                 end
                                 local bmMenu = require(ReplicatedStorage.Modules.Commerce.ShopSystem["ShopSystem Client"].BlackMarketMenu)
@@ -16238,10 +15917,7 @@ function Shared.BuildMainUI()
         end,
     })
 
-    UI.TB_Tabs.Main.Mob:AddDivider({
-        MarginTop = 6,
-        MarginBottom = 6,
-    })
+    UI.TB_Tabs.Main.Mob:AddDivider({ MarginTop = 6, MarginBottom = 6 })
 
     do
         local client = VoxCore and VoxCore.Client
@@ -16351,10 +16027,7 @@ function Shared.BuildMainUI()
             end,
         })
 
-        UI.TB_Tabs.Main.Mob:AddDivider({
-            MarginTop = 6,
-            MarginBottom = 6,
-        })
+        UI.TB_Tabs.Main.Mob:AddDivider({ MarginTop = 6, MarginBottom = 6 })
 
         local mobDropItems = (client and client.GetMobDropItems and client.GetMobDropItems()) or {}
         UI.TB_Tabs.Main.Mob:AddDropdown("MobDropItems", {
@@ -16412,78 +16085,34 @@ function Shared.BuildMainUI()
 
     -- MAIN TAB (FARMING -> BOSS)
     do
+        local function addBossToggle(id, text, cfgKey, loopKey)
+            UI.TB_Tabs.Main.Boss:AddToggle(id, {
+                Text = text,
+                Default = false,
+                Callback = function(on)
+                    if Shared.RefreshingToggles and not on then return end
+                    if not (VoxCore and VoxCore.CFG and VoxCore.Client) then return end
+                    if on then
+                        VoxCore.CFG.AutoRaid = false
+                        VoxCore.Client.RaidToken = (VoxCore.Client.RaidToken or 0) + 1
+                        VoxCore.CFG.AutoFish = false
+                        VoxCore.CFG[cfgKey] = true
+                        if Shared.RefreshToggles then Shared.RefreshToggles() end
+                        if VoxCore.Client[loopKey] then VoxCore.Client[loopKey]() end
+                    else
+                        VoxCore.CFG[cfgKey] = false
+                    end
+                end,
+            })
+        end
         BindMapMultiDropdown(UI.TB_Tabs.Main.Boss, "WantedBossTargets", VoxCore and VoxCore.Client and VoxCore.Client.BOSS_LIST, VoxCore and VoxCore.CFG and VoxCore.CFG.TargetBosses, true)
-
-        UI.TB_Tabs.Main.Boss:AddToggle("WantedBoss", {
-            Text = "Wanted Boss",
-            Default = false,
-            Callback = function(on)
-                if Shared.RefreshingToggles and not on then return end
-                if not (VoxCore and VoxCore.CFG and VoxCore.Client) then return end
-                if on then
-                    VoxCore.CFG.AutoRaid = false
-                    VoxCore.Client.RaidToken = (VoxCore.Client.RaidToken or 0) + 1
-                    VoxCore.CFG.AutoFish = false
-                    VoxCore.CFG.AutoBoss = true
-                    if Shared.RefreshToggles then Shared.RefreshToggles() end
-                    if VoxCore.Client.BossLoop then VoxCore.Client.BossLoop() end
-                else
-                    VoxCore.CFG.AutoBoss = false
-                end
-            end,
-        })
-
-        UI.TB_Tabs.Main.Boss:AddDivider({
-            MarginTop = 6,
-            MarginBottom = 6,
-        })
-
+        addBossToggle("WantedBoss", "Wanted Boss", "AutoBoss", "BossLoop")
+        UI.TB_Tabs.Main.Boss:AddDivider({ MarginTop = 6, MarginBottom = 6 })
         BindMapMultiDropdown(UI.TB_Tabs.Main.Boss, "BoardBossTargets", VoxCore and VoxCore.Client and VoxCore.Client.BOARD_BOSS_LIST, VoxCore and VoxCore.CFG and VoxCore.CFG.TargetBoardBosses, true)
-
-        UI.TB_Tabs.Main.Boss:AddToggle("BoardBoss", {
-            Text = "Board Boss",
-            Default = false,
-            Callback = function(on)
-                if Shared.RefreshingToggles and not on then return end
-                if not (VoxCore and VoxCore.CFG and VoxCore.Client) then return end
-                if on then
-                    VoxCore.CFG.AutoRaid = false
-                    VoxCore.Client.RaidToken = (VoxCore.Client.RaidToken or 0) + 1
-                    VoxCore.CFG.AutoFish = false
-                    VoxCore.CFG.AutoBoardBoss = true
-                    if Shared.RefreshToggles then Shared.RefreshToggles() end
-                    if VoxCore.Client.BossLoop then VoxCore.Client.BossLoop() end
-                else
-                    VoxCore.CFG.AutoBoardBoss = false
-                end
-            end,
-        })
-
-        UI.TB_Tabs.Main.Boss:AddDivider({
-            MarginTop = 6,
-            MarginBottom = 6,
-        })
-
+        addBossToggle("BoardBoss", "Board Boss", "AutoBoardBoss", "BossLoop")
+        UI.TB_Tabs.Main.Boss:AddDivider({ MarginTop = 6, MarginBottom = 6 })
         BindMapMultiDropdown(UI.TB_Tabs.Main.Boss, "IslandBossTargets", VoxCore and VoxCore.Client and VoxCore.Client.ISLAND_BOSS_LIST, VoxCore and VoxCore.CFG and VoxCore.CFG.TargetIslandBosses, true)
-
-        UI.TB_Tabs.Main.Boss:AddToggle("IslandBoss", {
-            Text = "Island Boss",
-            Default = false,
-            Callback = function(on)
-                if Shared.RefreshingToggles and not on then return end
-                if not (VoxCore and VoxCore.CFG and VoxCore.Client) then return end
-                if on then
-                    VoxCore.CFG.AutoRaid = false
-                    VoxCore.Client.RaidToken = (VoxCore.Client.RaidToken or 0) + 1
-                    VoxCore.CFG.AutoFish = false
-                    VoxCore.CFG.AutoIslandBoss = true
-                    if Shared.RefreshToggles then Shared.RefreshToggles() end
-                    if VoxCore.Client.IslandBossLoop then VoxCore.Client.IslandBossLoop() end
-                else
-                    VoxCore.CFG.AutoIslandBoss = false
-                end
-            end,
-        })
+        addBossToggle("IslandBoss", "Island Boss", "AutoIslandBoss", "IslandBossLoop")
 
         local useKeyToggle = UI.TB_Tabs.Main.Boss:AddToggle("UseVoidWalkerKey", {
             Text = "Use Key",
@@ -16684,10 +16313,7 @@ function Shared.BuildMainUI()
             end)
         end
 
-        UI.TB_Tabs.Main.Trophy:AddDivider({
-            MarginTop = 6,
-            MarginBottom = 6,
-        })
+        UI.TB_Tabs.Main.Trophy:AddDivider({ MarginTop = 6, MarginBottom = 6 })
 
         UI.TB_Tabs.Main.Trophy:AddToggle("CollectCollectiblesActive", {
             Text = "Collect Collectibles",
@@ -16963,10 +16589,7 @@ function Shared.BuildMainUI()
             end,
         })
 
-        UI.TB_Tabs.Main.Fishing:AddDivider({
-            MarginTop = 6,
-            MarginBottom = 6,
-        })
+        UI.TB_Tabs.Main.Fishing:AddDivider({ MarginTop = 6, MarginBottom = 6 })
 
         BindMapMultiDropdown(UI.TB_Tabs.Main.Fishing, "FishSellRaritiesTarget", { "Common", "Uncommon", "Rare", "Epic" }, VoxCore and VoxCore.CFG and VoxCore.CFG.FishSellRarities, false)
 
@@ -17100,10 +16723,7 @@ function Shared.BuildMainUI()
             end,
         })
 
-        UI.TB_Tabs.Main.Raid:AddDivider({
-            MarginTop = 6,
-            MarginBottom = 6,
-        })
+        UI.TB_Tabs.Main.Raid:AddDivider({ MarginTop = 6, MarginBottom = 6 })
 
         local craftKeyBoss, craftKeyDiff = nil, nil
         local craftKeyDiffDD, craftKeyDD
@@ -17645,10 +17265,7 @@ function Shared.BuildMainUI()
             end,
         })
 
-        UI.TB_Tabs.Combat.Combat:AddDivider({
-            MarginTop = 6,
-            MarginBottom = 6,
-        })
+        UI.TB_Tabs.Combat.Combat:AddDivider({ MarginTop = 6, MarginBottom = 6 })
 
         UI.TB_Tabs.Combat.Combat:AddDropdown("CombatSkillKeys", {
             Values = { "Z", "X", "C", "V", "F", "G" },
@@ -17845,76 +17462,50 @@ local function disconnectFullbrightConnections()
     Shared.DisconnectConnectionGroup("Fullbright")
 end
 
+local FULLBRIGHT_VALUES = {
+    Brightness = 2, ClockTime = 14, GlobalShadows = false,
+    Ambient = Color3.new(1, 1, 1), OutdoorAmbient = Color3.new(1, 1, 1), FogEnd = 9e9,
+}
 local function captureLightingState(lighting)
-    return {
-        Brightness = lighting.Brightness,
-        ClockTime = lighting.ClockTime,
-        GlobalShadows = lighting.GlobalShadows,
-        Ambient = lighting.Ambient,
-        OutdoorAmbient = lighting.OutdoorAmbient,
-        FogEnd = lighting.FogEnd,
-    }
+    local st = {}
+    for k in pairs(FULLBRIGHT_VALUES) do st[k] = lighting[k] end
+    return st
 end
-
 local function isFullbrightState(lighting)
-    return lighting
-        and lighting.Brightness == 2
-        and lighting.ClockTime == 14
-        and lighting.GlobalShadows == false
-        and lighting.Ambient == Color3.new(1, 1, 1)
-        and lighting.OutdoorAmbient == Color3.new(1, 1, 1)
+    if not lighting then return false end
+    for k, v in pairs(FULLBRIGHT_VALUES) do
+        if k ~= "FogEnd" and lighting[k] ~= v then return false end
+    end
+    return true
 end
-
 local function applyFullbright()
     local lighting = Services.Lighting
     if not lighting or applyingFullbright then return end
     if not (Toggles.Fullbright and Toggles.Fullbright.Value) then return end
-    if not (not isFullbrightState(lighting)) then return end
-
+    if isFullbrightState(lighting) then return end
     applyingFullbright = true
-    lighting.Brightness = 2
-    lighting.ClockTime = 14
-    lighting.GlobalShadows = false
-    lighting.Ambient = Color3.new(1, 1, 1)
-    lighting.OutdoorAmbient = Color3.new(1, 1, 1)
-    lighting.FogEnd = 9e9
+    for k, v in pairs(FULLBRIGHT_VALUES) do lighting[k] = v end
     applyingFullbright = false
 end
-
 local function enableFullbright()
     local lighting = Services.Lighting
     if not lighting then return end
-
-    if not fullbrightApplied and not isFullbrightState(lighting) then
-        fullbrightBaseline = captureLightingState(lighting)
-    elseif fullbrightBaseline == nil then
+    if (not fullbrightApplied and not isFullbrightState(lighting)) or fullbrightBaseline == nil then
         fullbrightBaseline = captureLightingState(lighting)
     end
-
     disconnectFullbrightConnections()
     applyFullbright()
     fullbrightApplied = true
-
-    Shared.ConnectSignalGroup("Fullbright", lighting:GetPropertyChangedSignal("Brightness"), applyFullbright)
-    Shared.ConnectSignalGroup("Fullbright", lighting:GetPropertyChangedSignal("ClockTime"), applyFullbright)
-    Shared.ConnectSignalGroup("Fullbright", lighting:GetPropertyChangedSignal("GlobalShadows"), applyFullbright)
-    Shared.ConnectSignalGroup("Fullbright", lighting:GetPropertyChangedSignal("Ambient"), applyFullbright)
-    Shared.ConnectSignalGroup("Fullbright", lighting:GetPropertyChangedSignal("OutdoorAmbient"), applyFullbright)
-    Shared.ConnectSignalGroup("Fullbright", lighting:GetPropertyChangedSignal("FogEnd"), applyFullbright)
+    for k in pairs(FULLBRIGHT_VALUES) do
+        Shared.ConnectSignalGroup("Fullbright", lighting:GetPropertyChangedSignal(k), applyFullbright)
+    end
 end
-
 local function disableFullbright()
     local lighting = Services.Lighting
     if not lighting then return end
-
     disconnectFullbrightConnections()
     if fullbrightApplied and fullbrightBaseline then
-        lighting.Brightness = fullbrightBaseline.Brightness
-        lighting.ClockTime = fullbrightBaseline.ClockTime
-        lighting.GlobalShadows = fullbrightBaseline.GlobalShadows
-        lighting.Ambient = fullbrightBaseline.Ambient
-        lighting.OutdoorAmbient = fullbrightBaseline.OutdoorAmbient
-        lighting.FogEnd = fullbrightBaseline.FogEnd
+        for k, v in pairs(fullbrightBaseline) do lighting[k] = v end
     end
     fullbrightApplied = false
 end
@@ -17986,55 +17577,6 @@ function Shared.InitializeOptimizationToggles()
         Shared.ApplyRemoveAtmosphereState(Toggles.RemoveAtmosphere and Toggles.RemoveAtmosphere.Value)
     end)
 end
-
--- DISCORD WEBHOOK ALERTS RUNTIME
-local function NormalizeAlertEntryName(name)
-    if type(name) ~= "string" or name == "" then return nil end
-    return name
-end
-
-local function IsAlertEntryEnabled(itemName)
-    local normalizedName = NormalizeAlertEntryName(itemName)
-    if not normalizedName then return false, nil end
-    local selected = GetOptionTable(Options, "SelectedWebhookItems")
-    if type(selected) == "table" and (selected[normalizedName] == true or table.find(selected, normalizedName)) then
-        return true, normalizedName
-    end
-    return false, normalizedName
-end
-
-local function PostPlayerAlert(itemName)
-    if not GetToggleValue(Toggles, "SendWebhook") then return false end
-
-    local url = GetOptionString(Options, "WebhookURL")
-    if url == "" or not url:find("discord.com/api/webhooks/") then return false end
-
-    local shouldSend, normalizedName = IsAlertEntryEnabled(itemName)
-    if itemName ~= nil and not shouldSend then return false end
-
-    normalizedName = normalizedName or "Test Alert"
-    local payload = {
-        ["username"] = "Midgard Alerts",
-        ["avatar_url"] = ClientPublicConfig.AvatarUrl,
-        ["embeds"] = {{
-            ["description"] = "**Triggered Event:** " .. normalizedName,
-            ["color"] = 0x242424,
-        }}
-    }
-
-    TaskSpawn(function()
-        Shared.HttpRequest({
-            Url = url,
-            Method = "POST",
-            Headers = {["Content-Type"] = "application/json"},
-            Body = Services.HttpService:JSONEncode(payload)
-        })
-    end)
-
-    return true
-end
-
-Shared.PostToWebhook = PostPlayerAlert
 
 -- Bootstrap UI
 Shared.SaveManager = SaveManager
