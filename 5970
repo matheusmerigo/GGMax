@@ -3274,9 +3274,21 @@ GameClient.SetFruitESP = function(on)
 end
 local StoreBlacklist = setmetatable({}, { __mode = "k" })  -- [Tool] = true (frutas na mochila que o servidor recusou guardar)
 
--- Verifica no DataStore do jogo se ainda há espaço guardado para armazenar mais uma unidade dessa fruta.
--- Soma apenas o cofre/anúncios (Bank + Market) sem incluir Unequiped (a própria mochila do jogador).
+-- Verifica no DataStore do jogo se ainda há espaço na mochila/cofre para armazenar mais uma unidade dessa fruta.
 local function canStoreFruit(fruitName)
+    if MainModules and MainModules.ToolsInfo and MainModules.ToolsUtils and MainModules.ToolsUtils.GetOwnedAmount and MainModules.ToolsUtils.GetMaxOwned then
+        local okCan, resCan = pcall(function()
+            local tInfo = MainModules.ToolsInfo:Get(fruitName)
+            if not tInfo then return nil end
+            local owned = MainModules.ToolsUtils.GetOwnedAmount(nil, fruitName) or 0
+            local maxOwned = MainModules.ToolsUtils.GetMaxOwned(tInfo) or 1
+            return owned < maxOwned
+        end)
+        if okCan and type(resCan) == "boolean" then
+            return resCan
+        end
+    end
+
     local data = getData()
     if not data or not data.Tools then return true end
 
@@ -3289,12 +3301,20 @@ local function canStoreFruit(fruitName)
     local maxStored = (data.Tools.MaxStoredFruits or 1) + extra
 
     local storedCount = 0
-    for _, list in ipairs({ data.Tools.Bank, data.Tools.Market }) do
+    for _, list in ipairs({ data.Tools.Equiped, data.Tools.Unequiped, data.Tools.Bank }) do
         if type(list) == "table" then
             for _, item in pairs(list) do
                 if type(item) == "table" and (item.Name or item.ToolName) == fruitName then
                     storedCount += (item.Quantity or 1)
                 end
+            end
+        end
+    end
+    if type(data.Market) == "table" and type(data.Market.Listings) == "table" then
+        for _, listing in pairs(data.Market.Listings) do
+            local td = type(listing) == "table" and listing.ToolData
+            if type(td) == "table" and (td.Name or td.ToolName) == fruitName then
+                storedCount += (td.Quantity or 1)
             end
         end
     end
@@ -3518,6 +3538,21 @@ Features.Fruit = {
     Scan = scanFruits,
     Held = heldFruits,
     Store = storeFruits,
+    HasCollectableFruit = function()
+        local now = os.clock()
+        for f in pairs(Fruits) do
+            if f.Parent and fruitPart(f) then
+                if GameClient.FruitMatchesRarityFilter(f)
+                    and not (SkipFruits[f] and now < SkipFruits[f])
+                    and not hasHeldFruit(f.Name)
+                    and not (CFG.AutoStoreFruit and not canStoreFruit(f.Name))
+                then
+                    return true
+                end
+            end
+        end
+        return false
+    end,
 }
 end
 
@@ -11212,6 +11247,7 @@ local function hasVoidWalkerKey()
     end
     return false
 end
+GameClient.HasVoidWalkerKey = hasVoidWalkerKey
 
 local function getSelectedIslandBosses()
     local list = {}
@@ -12114,6 +12150,7 @@ function GameClient.StartFortRaidLoop()
                     GameClient.PauseMainModesForBoss()
                 end
                 lootedAt = nil
+                State.fortRaidLootedAt = nil
                 local _, hrp = getChar()
                 if hrp and (hrp.Position - activePosition).Magnitude > 650 then
                     Status = "Fort Raid: viajando para " .. activeFort
@@ -12160,6 +12197,7 @@ function GameClient.StartFortRaidLoop()
                     end
                     GameClient.LootFortRaid(fortFolder, activeFort, fightAborted, logFort)
                     lootedAt = fortFolder:GetAttribute("VaultOpenedAt") or openedAt
+                    State.fortRaidLootedAt = lootedAt
                 else
                     releaseFortPriority()
                     if not (CFG.MainModeActive or CFG.AutoMob) then
@@ -12169,6 +12207,7 @@ function GameClient.StartFortRaidLoop()
                 end
             else
                 lootedAt = nil
+                State.fortRaidLootedAt = nil
                 releaseFortPriority()
                 if not (CFG.MainModeActive or CFG.AutoMob) then
                     local nextAt = fortFolder:GetAttribute("NextOpenAt")
@@ -14678,17 +14717,27 @@ function GameClient.EnsureFruitHopLoop()
     local myTok = State.Tokens.FruitHop
     ensureFruitHopInit()
     local function hasPendingHopWork()
-        if CFG.AutoFruitHop or (CFG.AutoUniversalHop and CFG.AutoFruit) then
-            if collecting then return true end
-            for f in pairs(Features.Fruit.Items) do
-                if f.Parent and not Features.Fruit.Skip[f] and GameClient.FruitMatchesRarityFilter(f) then
-                    return true
-                end
+        if isDeadOrRespawning() then return true, "respawn" end
+        if Combat.IsInCutscene and Combat.IsInCutscene() then return true, "cutscene" end
+        if LP.Character and LP.Character:GetAttribute("CarriedChest") ~= nil then return true, "carried_chest" end
+        if GameClient.CampfireActive then return true, "campfire" end
+        if GameClient.InventoryAutomationBusy then return true, "inventory_busy" end
+        if State.raidInArena or (GameClient.BossRoomsFight and GameClient.BossRoomsFight.Payload ~= nil) or CFG.AutoRaid then
+            return true, "raid"
+        end
+        if CFG.AutoDungeon then return true, "dungeon" end
+        if State.blackMarketBusy then return true, "blackmarket_busy" end
+        if collecting then return true, "collecting" end
+
+        if CFG.AutoFruitHop or (CFG.AutoUniversalHop and (CFG.AutoCollectFruit or CFG.AutoFruit)) then
+            if Features.Fruit and Features.Fruit.HasCollectableFruit and Features.Fruit.HasCollectableFruit() then
+                return true, "fruit"
             end
         end
+
         if CFG.AutoUniversalHop then
             if CFG.AutoBoss or CFG.AutoBoardBoss then
-                if State.bossBusy then return true end
+                if State.bossBusy then return true, "boss_busy" end
                 local ign = workspace:FindFirstChild("IgnoreList")
                 local dataF = ign and ign:FindFirstChild("Data")
                 local beacons = dataF and dataF:FindFirstChild("BossBeacons")
@@ -14696,7 +14745,7 @@ function GameClient.EnsureFruitHopLoop()
                     for bName, on in pairs(CFG.TargetBosses) do
                         if on then
                             if (beacons and beacons:FindFirstChild(bName) ~= nil) or (GameClient.FindWorldBoss and GameClient.FindWorldBoss(bName) ~= nil) then
-                                return true
+                                return true, "boss:" .. tostring(bName)
                             end
                         end
                     end
@@ -14705,71 +14754,99 @@ function GameClient.EnsureFruitHopLoop()
                     for bName, on in pairs(CFG.TargetBoardBosses) do
                         if on then
                             if (beacons and beacons:FindFirstChild(bName) ~= nil) or (GameClient.FindWorldBoss and GameClient.FindWorldBoss(bName) ~= nil) then
-                                return true
+                                return true, "boss:" .. tostring(bName)
                             end
                         end
                     end
                 end
             end
             if CFG.AutoIslandBoss then
-                if State.islandBossBusy then return true end
+                if State.islandBossBusy then return true, "island_boss_busy" end
                 local ign = workspace:FindFirstChild("IgnoreList")
                 local dataF = ign and ign:FindFirstChild("Data")
                 local beacons = dataF and dataF:FindFirstChild("BossBeacons")
                 if type(CFG.TargetIslandBosses) == "table" then
                     for bName, on in pairs(CFG.TargetIslandBosses) do
                         if on and ((beacons and beacons:FindFirstChild(bName) ~= nil) or (GameClient.FindWorldBoss and GameClient.FindWorldBoss(bName) ~= nil)) then
-                            return true
+                            return true, "island_boss:" .. tostring(bName)
+                        end
+                    end
+                    if CFG.TargetIslandBosses["VoidWalker Mordrek"] and CFG.UseVoidWalkerKey and GameClient.HasVoidWalkerKey and GameClient.HasVoidWalkerKey() then
+                        local respawns = dataF and dataF:FindFirstChild("BossRespawns")
+                        local rNode = respawns and respawns:FindFirstChild("VoidWalker Mordrek")
+                        local rAt = rNode and rNode:GetAttribute("RespawnAt")
+                        if not (type(rAt) == "number" and rAt > workspace:GetServerTimeNow()) then
+                            return true, "voidwalker_key"
                         end
                     end
                 end
             end
-            if CFG.AutoSeaBeast then
-                if State.seaBeastBusy then return true end
+            if CFG.AutoSeaBeast and getLevel() >= 325 then
+                if State.seaBeastBusy then return true, "seabeast_busy" end
+                if typeof(LP:GetAttribute("SeaBeastEvent")) == "Vector3" or typeof(LP:GetAttribute("SeaBeastEventArea")) == "Vector3" then
+                    return true, "seabeast_event"
+                end
                 local ef = playability("Enemys")
                 if ef then
                     for _, m in ipairs(ef:GetChildren()) do
                         if m:IsA("Model") and mobAlive(m) then
                             local orig = m:GetAttribute("OriginalName") or baseName(m)
                             if orig == "Sea Beast" or orig == "Ancestral Sea Beast" then
-                                return true
+                                return true, "seabeast_model"
                             end
                         end
                     end
                 end
             end
-            if CFG.AutoFortRaid then
-                if State.fortRaidBusy then return true end
-                local ign = workspace:FindFirstChild("IgnoreList")
-                local dataF = ign and ign:FindFirstChild("Data")
-                local forts = dataF and dataF:FindFirstChild("FortRaids")
-                if forts and #forts:GetChildren() > 0 then
-                    return true
+            if CFG.AutoFortRaid and getLevel() >= 325 then
+                if State.fortRaidBusy then return true, "fortraid_busy" end
+                local fortFolder = GameClient.GetFortRaidFolder and GameClient.GetFortRaidFolder()
+                if fortFolder then
+                    local state = fortFolder:GetAttribute("RaidState")
+                    local activeFort = fortFolder:GetAttribute("ActiveFort")
+                    if state == "Open" and type(activeFort) == "string" then
+                        return true, "fortraid_open"
+                    elseif state == "Completed" and type(activeFort) == "string" then
+                        local openedAt = fortFolder:GetAttribute("VaultOpenedAt") or "pending"
+                        if State.fortRaidLootedAt ~= openedAt then
+                            return true, "fortraid_loot"
+                        end
+                    end
                 end
             end
+            if CFG.AutoBlackMarket and GameClient.HasPendingBlackMarket and GameClient.HasPendingBlackMarket() then
+                return true, "blackmarket"
+            end
         end
-        return false
+        return false, nil
     end
     task.spawn(function()
+        if (CFG.AutoCollectFruit or CFG.AutoFruitHop) and GameClient.ScanFruits then
+            GameClient.ScanFruits()
+        end
         SafeRuntime.RunResilientLoop("FruitHopLoop", function() return (CFG.AutoFruitHop or CFG.AutoUniversalHop) and State.Tokens.FruitHop == myTok end, function()
         while (CFG.AutoFruitHop or CFG.AutoUniversalHop) and State.Tokens.FruitHop == myTok do
             if LP:GetAttribute("InGame") ~= true then
                 task.wait(0.5)
                 continue
             end
-            -- Aguarda janela curta para detectar eventos/frutas no servidor e terminar execução
+            -- Aguarda janela de 10s sem eventos/frutas pendentes; qualquer pendência reinicia a contagem
             local t0 = os.clock()
             while (CFG.AutoFruitHop or CFG.AutoUniversalHop) and State.Tokens.FruitHop == myTok and os.clock() - t0 < 10 do
-                if hasPendingHopWork() then
+                local busy, reason = hasPendingHopWork()
+                if busy then
                     t0 = os.clock()
+                    LogDebugEventThrottled("fruit_debug.txt", "hop_hold", "HOP_HOLD", "reason=" .. tostring(reason), 5)
+                else
+                    if not (CFG.MainModeActive or CFG.AutoMob) then
+                        Status = ("Hop: trocando em %ds..."):format(math.max(1, math.ceil(10 - (os.clock() - t0))))
+                    end
                 end
-                task.wait(0.5)
+                task.wait(0.25)
             end
             if not ((CFG.AutoFruitHop or CFG.AutoUniversalHop) and State.Tokens.FruitHop == myTok) then break end
 
             if os.clock() - lastJoin < 6 then task.wait(1); continue end
-            visited[game.JobId] = os.time()
-            saveVisited()
 
             local okList, list = pcall(function() return listApi and listApi:GetActiveServers() end)
             local pool = {}
@@ -14784,6 +14861,15 @@ function GameClient.EnsureFruitHopLoop()
                 end
                 table.sort(pool, function(a, b) return a.Players < b.Players end)
             end
+
+            local busyNow, reasonNow = hasPendingHopWork()
+            if busyNow then
+                LogDebugEvent("fruit_debug.txt", "HOP_ABORT_PREJOIN", "reason=" .. tostring(reasonNow))
+                continue
+            end
+
+            visited[game.JobId] = os.time()
+            saveVisited()
 
             local target = pool[1]
             pendingFail = nil
@@ -14802,7 +14888,12 @@ function GameClient.EnsureFruitHopLoop()
                     elseif GameModules then GameModules.Network:SafeInvokeServer(10, "ServerList", "QuickJoin") end
                 end)
             end
-            task.wait(8)
+            local tPost = os.clock()
+            while (CFG.AutoFruitHop or CFG.AutoUniversalHop) and State.Tokens.FruitHop == myTok
+                and os.clock() - tPost < 8 and pendingFail == nil do
+                if hasPendingHopWork() then break end
+                task.wait(0.25)
+            end
             if pendingFail and target then
                 failCount[target.JobId] = (failCount[target.JobId] or 0) + 1
             end
@@ -16225,6 +16316,7 @@ do
                         end
                         if #buyPlan > 0 then
                             LogDebugEvent("blackmarket_debug.txt", "BUY_PLAN", ("items=%d visitKey=%s"):format(#buyPlan, tostring(visitKey)))
+                            State.blackMarketBusy = true
                             local snap = Features.PauseForInterrupt and Features.PauseForInterrupt() or nil
                             pcall(function()
                                 local gcf = pt.CFrame
@@ -16256,6 +16348,7 @@ do
                                     visitedNights[visitKey] = true
                                 end
                             end)
+                            State.blackMarketBusy = false
                             if Features.ResumeAfterInterrupt and snap then
                                 Features.ResumeAfterInterrupt(snap)
                             else
@@ -16265,8 +16358,47 @@ do
                     end
                 end
             end
-            end, function(err) cancelTween() end)
+            end, function(err) State.blackMarketBusy = false; cancelTween() end)
         end)
+    end
+
+    function GameClient.HasPendingBlackMarket()
+        if not CFG.AutoBlackMarket then return false end
+        if State.blackMarketBusy then return true end
+        local bm = MainModules and MainModules.BlackMarketUtils
+        if not (bm and bm.GetActivePoint) or next(CFG.BlackMarketTargets or {}) == nil then
+            return false
+        end
+        local pt, nightIdx = bm.GetActivePoint()
+        local visitKey = (pt and bm.GetVisitKey) and bm.GetVisitKey(pt, nightIdx or 0) or nil
+        if not (pt and pt.CFrame and visitKey and not visitedNights[visitKey]) then
+            return false
+        end
+        local data = getData()
+        local mon = data and data.Monetization
+        local frag = mon and mon.Fragment or 0
+        local gold = mon and mon.Gold or 0
+        for _, entry in ipairs(GameClient.GetBlackMarketItems()) do
+            local toolName, _, _, info = entry[1], entry[2], entry[3], entry[4]
+            if CFG.BlackMarketTargets[toolName] then
+                local maxQty = math.clamp(math.floor(tonumber(CFG.BlackMarketAmount) or 1), 1, 10)
+                local owned, maxOwned = 0, 999
+                pcall(function()
+                    local tInfo = MainModules.ToolsInfo:Get(toolName)
+                    if tInfo and MainModules.ToolsUtils then
+                        owned = MainModules.ToolsUtils.GetOwnedAmount(nil, toolName) or 0
+                        maxOwned = MainModules.ToolsUtils.GetMaxOwned(tInfo) or 999
+                    end
+                end)
+                local room = math.max(0, maxOwned - owned)
+                local bal = (info.Currency == "Fragment") and frag or gold
+                local afford = (info.Price > 0) and math.floor(bal / info.Price) or maxQty
+                if math.min(maxQty, room, afford) >= 1 then
+                    return true
+                end
+            end
+        end
+        return false
     end
 end
 
