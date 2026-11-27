@@ -1285,10 +1285,15 @@ function Movement.TweenSegment(targetCF, abortIf, opts)
         pcall(function() tw:Destroy() end)
     end)
     tw:Play()
+    local lastPos = hrp.Position
     while not done and Movement.activeTween == tw do
         if isDeadOrRespawning() or (abortIf and abortIf()) then break end
         local _, h = getChar()
         if not h then break end
+        if (h.Position - lastPos).Magnitude > math.max(350, (CFG.TweenSpeed or 250) * 0.5) then
+            break
+        end
+        lastPos = h.Position
         h.AssemblyLinearVelocity = Vector3.zero
         h.AssemblyAngularVelocity = Vector3.zero
         RunService.Heartbeat:Wait()
