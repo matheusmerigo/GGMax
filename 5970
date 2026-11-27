@@ -393,6 +393,14 @@ else
 end
 GlobalEnv[BootstrapStateInfra.BootingKey] = MidgardBootstrapToken
 GlobalEnv[BootstrapStateInfra.RuntimeTokenKey] = MidgardRuntimeToken
+GenericInfra.Bootstrap.Finish = function(success: boolean?)
+    if GlobalEnv[BootstrapStateInfra.BootingKey] == MidgardBootstrapToken then
+        GlobalEnv[BootstrapStateInfra.BootingKey] = nil
+    end
+    if success == false and GlobalEnv[BootstrapStateInfra.RuntimeTokenKey] == MidgardRuntimeToken then
+        GlobalEnv[BootstrapStateInfra.RunningKey] = false
+    end
+end
 do
     local libraryUrl = RepoConfig.LibraryOverrideUrl
     local saveManagerUrl = RepoConfig.SaveManagerOverrideUrl
@@ -1881,11 +1889,21 @@ end
 function Features.BestQuest(lvl)
     local best, bestInfo
     if not MainModules then return end
+    local canTakeFn = MainModules.QuestsUtils and MainModules.QuestsUtils.CanTake
     for name, info in pairs(MainModules.QuestsInfo) do
         if type(info) == "table" and info.GrindingQuest and type(info.Arguments) == "table"
             and type(info.Arguments.Giver) == "string" and (info.MinLevel or 0) <= lvl
             and not info.Arguments.IsBoss then
-            if not bestInfo or (info.MinLevel or 0) > (bestInfo.MinLevel or 0) then best, bestInfo = name, info end
+            local canTake = true
+            if canTakeFn then
+                local okCan, resCan = pcall(canTakeFn, LP, name)
+                if okCan and resCan == false then
+                    canTake = false
+                end
+            end
+            if canTake and (not bestInfo or (info.MinLevel or 0) > (bestInfo.MinLevel or 0)) then
+                best, bestInfo = name, info
+            end
         end
     end
     return best, bestInfo
@@ -2293,6 +2311,23 @@ local function goNear(pos, aborted, opts)
 end
 
 function Features.TryAcceptQuest(name, info, aborted)
+    if MainModules and MainModules.QuestsUtils and MainModules.QuestsUtils.CanTake then
+        local okCan, resCan = pcall(MainModules.QuestsUtils.CanTake, LP, name)
+        if okCan and resCan == false then
+            Status = "Quest indisponível: " .. tostring(name)
+            return false
+        end
+    end
+    if GameClient.TryNativeRepeatQuest(name) then
+        Status = ("Repetindo quest: %s"):format(info.Title or name)
+        local tRep = os.clock()
+        while os.clock() - tRep < 1.5 and not (aborted and aborted()) do
+            if Features.ActiveQuest() == name then
+                return true
+            end
+            task.wait(0.15)
+        end
+    end
     local giver = info.Arguments.Giver
     local pos = giverPos(giver)
     if not pos then
@@ -2329,7 +2364,7 @@ function Features.TryAcceptQuest(name, info, aborted)
     for _ = 1, 3 do
         if aborted() then return false end
         Status = ("Aceitando quest: %s"):format(info.Title or name)
-        pcall(function() GameModules.Network:FireServer("Quests", "AcceptGrinding", name) end)
+        GameClient.FireNet("Quests", "AcceptGrinding", name)
         local t0 = os.clock()
         while os.clock() - t0 < 2 do
             if Features.ActiveQuest() == name then
@@ -2669,7 +2704,7 @@ function Features.InitCombatCore()
                     task.wait(1)
                 else
                     local lvl = getLevel()
-                    local nameSet, questName
+                    local nameSet, questName, questInfoRef
 
                     -- 1) quests por nível
                     if CFG.AutoQuest and MainModules then
@@ -2680,7 +2715,7 @@ function Features.InitCombatCore()
                             if maxLv and lvl > maxLv and bName and bName ~= aName then
                                 Status = "Trocando para quest de nível maior..."
                                 logFarm(("QUEST_ABANDON %s -> %s (lv=%d > max=%d)"):format(tostring(aName), tostring(bName), lvl, maxLv))
-                                pcall(function() GameModules.Network:FireServer("Quests", "Abandon", aName) end)
+                                GameClient.FireNet("Quests", "Abandon", aName)
                                 task.wait(0.6)
                                 continue_ = true
                             else
@@ -2691,10 +2726,10 @@ function Features.InitCombatCore()
                                     local t0 = os.clock()
                                     while not aborted() and Features.ActiveQuest() == aName and os.clock() - t0 < 6 do task.wait(0.3) end
                                     if Features.ActiveQuest() == aName then
-                                        pcall(function() GameModules.Network:FireServer("Quests", "Repeat") end)
+                                        GameClient.FireNet("Quests", "Repeat")
                                     end
                                 else
-                                    nameSet, questName = set, aName
+                                    nameSet, questName, questInfoRef = set, aName, aInfo
                                 end
                             end
                         elseif bName and os.clock() >= State.questCooldown then
@@ -2743,14 +2778,44 @@ function Features.InitCombatCore()
                                 goNear(mk.Position, function() return aborted() or Combat.PickTarget(lvl, mk.Position, nameSet) ~= nil end)
                                 task.wait(0.5)
                             else
-                                Status = ("Sem alvo (Lv %d)%s"):format(lvl, questName and " · quest sem spawn" or "")
-                                logFarm(("NO_TARGET lv=%d quest=%s"):format(lvl, tostring(questName)))
-                                task.wait(1)
+                                local movedIsl = false
+                                local giverName = questInfoRef and questInfoRef.Arguments and questInfoRef.Arguments.Giver
+                                if type(giverName) == "string" then
+                                    local rawIsl = giverName:gsub("%s*Quest Giver$", "")
+                                    local areaName = GameClient.ResolveAreaName(rawIsl) or GameClient.ResolveAreaName(questName or "")
+                                    local areasF = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Areas")
+                                    local area = areaName and areasF and areasF:FindFirstChild(areaName)
+                                    local center = area and area:GetAttribute("MapCenter")
+                                    if typeof(center) == "Vector3" then
+                                        local alt = area:GetAttribute("MapAltitude") or 14
+                                        local destPos = center + Vector3.new(0, alt + 12, 0)
+                                        if (hrp2.Position - destPos).Magnitude > 450 then
+                                            Status = ("Indo para %s..."):format(areaName)
+                                            logFarm(("GO_ISLAND %s quest=%s"):format(tostring(areaName), tostring(questName)))
+                                            goNear(destPos, function() return aborted() or Combat.PickTarget(lvl, hrp2.Position, nameSet) ~= nil end)
+                                            movedIsl = true
+                                        end
+                                    end
+                                end
+                                if not movedIsl then
+                                    Status = ("Sem alvo (Lv %d)%s"):format(lvl, questName and " · quest sem spawn" or "")
+                                    logFarm(("NO_TARGET lv=%d quest=%s"):format(lvl, tostring(questName)))
+                                    task.wait(1)
+                                end
                             end
                         elseif target then
                             logFarm(("FIGHT %s | lv=%d | quest=%s"):format(target.Name, lvl, tostring(questName)))
+                            local bOrig = baseName(target)
                             local function tAborted()
-                                return aborted() or not mobAlive(target)
+                                if aborted() or not mobAlive(target) then return true end
+                                if questName and questInfoRef then
+                                    local cQ2, cInfo2, cProg2 = Features.ActiveQuest()
+                                    if cQ2 == questName and cInfo2 then
+                                        local pSet2 = Features.PendingNames(cInfo2, cProg2)
+                                        if pSet2 and not pSet2[bOrig] then return true end
+                                    end
+                                end
+                                return false
                             end
                             fightTarget(target, tAborted, questName and "Quest" or "Atacando", { checkStuck = true, allowGoNear = true })
                         end
@@ -4670,12 +4735,13 @@ end
 
 local function isMinigameOpen()
     local pg = LP:FindFirstChild("PlayerGui")
-    return pg ~= nil and (pg:FindFirstChild("DodgeMinigameGui") ~= nil or pg:FindFirstChild("StoneBreakGui") ~= nil)
+    return pg ~= nil and (pg:FindFirstChild("DodgeMinigameGui") ~= nil or pg:FindFirstChild("StoneBreakGui") ~= nil or pg:FindFirstChild("MiningGui") ~= nil or pg:FindFirstChild("ForgeMinigameHud") ~= nil)
 end
 
 local function startMinigameSolver(aborted)
     task.spawn(function()
         local lastDodgeHit = 0
+        local lastMiningHit = 0
         local firedStones = setmetatable({}, { __mode = "k" })
         local solvedCards = setmetatable({}, { __mode = "k" })
         local function pressMinigameKey(ch, gui)
@@ -4701,6 +4767,7 @@ local function startMinigameSolver(aborted)
             local pg = LP:FindFirstChild("PlayerGui")
             local dGui = pg and pg:FindFirstChild("DodgeMinigameGui")
             local sGui = pg and pg:FindFirstChild("StoneBreakGui")
+            local mGui = pg and pg:FindFirstChild("MiningGui")
             if dGui then
                 local keyHint = dGui:FindFirstChild("KeyHint", true)
                 local letterLbl = keyHint and keyHint:FindFirstChild("Letter")
@@ -4761,6 +4828,25 @@ local function startMinigameSolver(aborted)
                                 end)
                             end
                             if fired then firedStones[desc] = true end
+                        end
+                    end
+                end
+                RunService.RenderStepped:Wait()
+            elseif mGui then
+                local track = mGui:FindFirstChild("Track", true)
+                local zone = track and track:FindFirstChild("Zone")
+                local marker = track and track:FindFirstChild("Marker")
+                if zone and marker and zone:IsA("GuiObject") and marker:IsA("GuiObject") and (os.clock() - lastMiningHit) >= 0.38 then
+                    local dist = math.abs(marker.Position.X.Scale - zone.Position.X.Scale)
+                    local tol = math.max(0.015, zone.Size.X.Scale * 0.32)
+                    if dist <= tol then
+                        lastMiningHit = os.clock()
+                        if VirtualInputManager then
+                            pcall(function()
+                                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.ButtonA, false, game)
+                                task.wait(0.02)
+                                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.ButtonA, false, game)
+                            end)
                         end
                     end
                 end
@@ -5857,6 +5943,7 @@ GameClient.SECONDARY_QUESTS = {
     { "Shadow over Kraken's Rest", "Corwin Hale", "Wandering Bastille" },
     { "The Pawnbroker's Map", "Pawnbroker", "Harbor Island" },
     { "The VoidWalker's End", "One-Eyed Vorn", "Kraken's rest" },
+    { "The Lost Tool Bag", "Doran Pike", "Volcano Island" },
 }
 GameClient.SECONDARY_QUEST_GIVERS = {}
 GameClient.SECONDARY_QUEST_ORDER = {}
@@ -5941,9 +6028,18 @@ local function nextAvailableSecondaryQuest(skipped)
     local lvl = getLevel()
     local dGold = getData()
     local curGold = dGold and dGold.Monetization and dGold.Monetization.Gold
+    local isRelFn = MainModules.Constants and MainModules.Constants.IsReleased
     for _, qName in ipairs(GameClient.SECONDARY_QUEST_ORDER) do
         if not (skipped and skipped[qName]) then
-            local info = MainModules.QuestsInfo[qName]
+            local islName = GameClient.SECONDARY_QUEST_ISLANDS[qName]
+            local islReleased = true
+            if isRelFn and islName then
+                local okR, resR = pcall(isRelFn, islName)
+                if okR and resR == false then
+                    islReleased = false
+                end
+            end
+            local info = islReleased and getQuestInfo(qName) or nil
             if info then
                 local minLv = info.MinLevel or 0
                 if lvl >= minLv then
@@ -6364,12 +6460,50 @@ local function resolveDirectObjectivePoint(obj)
         return (hrpE and (GameClient.IsNautiliaPos(hrpE.Position) or hrpE.Position.Y < -2000))
             and Vector3.new(13352.34, -5507.55, -11675.42)
             or Vector3.new(7783.27, 48.09, -13602.54)
+    elseif oid == "Collect_ToolBag_SQ" then
+        local okBag, bagPos = pcall(function()
+            local area = MainModules and MainModules.AreaAssets and MainModules.AreaAssets.Area("Volcano Island")
+            local qf = area and area:FindFirstChild("Quests")
+            local qt = qf and qf:FindFirstChild("Quest_ToolBag_SQ")
+            local tb = qt and qt:FindFirstChild("ToolBag_SQ")
+            return tb and extractVec3(tb) or nil
+        end)
+        if okBag and bagPos then return bagPos end
+        return GameClient.findQuestZonePos("Collect_ToolBag_SQ")
+    elseif oid == "Talk_DoranPike_SQ" then
+        return giverPos("Doran Pike")
+    elseif oid == "Deliver_LightSword_VO" then
+        return giverPos("Edric Vale_VO")
+    elseif oid == "Deliver_SturdyAxe_VO" then
+        return giverPos("Marta Quill_VO")
+    elseif oid == "Deliver_BalancedSpear_VO" then
+        return giverPos("Sera Dunmore_VO")
+    elseif oid == "Deposit_VolcanoOre_VO" then
+        local okCart, cartPos = pcall(function()
+            local props = workspace.IgnoreList.Data.Quests.Props
+            local vi2 = props and props:FindFirstChild("Volcano Island 2")
+            local cart = vi2 and vi2:FindFirstChild("MineCart")
+            return cart and extractVec3(cart) or nil
+        end)
+        if okCart and cartPos then return cartPos end
+        return GameClient.findQuestZonePos("Deposit_VolcanoOre_VO") or extractVec3(GameClient.GetInterestPoint("MineCart_VO"))
+    elseif oid == "Forge_Regulator_VO" or oid == "Forge_LightSword_VO" or oid == "Forge_SturdyAxe_VO" or oid == "Forge_BalancedSpear_VO" or oid == "Repair_NautiliaKey_VO" then
+        local okForge, forgePos = pcall(function()
+            local vi = workspace.Map.Areas["Volcano Island"].Interiors["Volcano Interior"]
+            local fm = vi and vi:FindFirstChild("Forge MiniGame")
+            local balde = fm and fm:FindFirstChild("Balde")
+            local bottom = balde and balde:FindFirstChild("Bottom")
+            local body = bottom and bottom:FindFirstChild("2_low.001")
+            return body and extractVec3(body) or nil
+        end)
+        if okForge and forgePos then return forgePos end
+        return GameClient.findQuestZonePos("StoryForge_VO") or extractVec3(GameClient.GetInterestPoint("SmallForge_VO"))
     end
     local officialPoint = extractVec3(GameClient.GetInterestPoint(oid))
     if officialPoint then return officialPoint end
     if oid:sub(1, 5) == "Talk_" then
         local npcId = oid:sub(6)
-        local npcBase = npcId:gsub("_OTFinal$",""):gsub("_Harbor$",""):gsub("_SOL$",""):gsub("_GD$",""):gsub("_SP$",""):gsub("_SU$",""):gsub("_SL$",""):gsub("_VAL$",""):gsub("_WB$",""):gsub("_FI$",""):gsub("_PI$",""):gsub("_CT$",""):gsub("_SK$",""):gsub("_HI$",""):gsub("_FR$",""):gsub("_FS$",""):gsub("_OT$",""):gsub("_KR$",""):gsub("_HK$",""):gsub("_VO$",""):gsub("_NE$",""):gsub("_NA$",""):gsub("_MF$","")
+        local npcBase = npcId:gsub("_OTFinal$",""):gsub("_Harbor$",""):gsub("_SOL$",""):gsub("_GD$",""):gsub("_SP$",""):gsub("_SU$",""):gsub("_SL$",""):gsub("_VAL$",""):gsub("_WB$",""):gsub("_FI$",""):gsub("_PI$",""):gsub("_CT$",""):gsub("_SK$",""):gsub("_HI$",""):gsub("_FR$",""):gsub("_FS$",""):gsub("_OT$",""):gsub("_KR$",""):gsub("_HK$",""):gsub("_VO$",""):gsub("_NE$",""):gsub("_NA$",""):gsub("_MF$",""):gsub("_SQ$","")
         GameClient._TalkNpcMap = GameClient._TalkNpcMap or {
             ChiefFestival = "VillageChief", ChiefSupplies = "VillageChief", ChiefNoTime = "VillageChief",
             ChiefPatrol = "VillageChief", ChiefVictory = "VillageChief", ChiefFestivalEnd = "VillageChief",
@@ -6414,6 +6548,13 @@ local function resolveDirectObjectivePoint(obj)
             LunaelDetector = "Lunael_NA", LunaelHugo = "Lunael_NA", LunaelPromise = "Lunael_NA",
             AssistantRepair = "Repair Assistant_NA", AssistantGears = "Repair Assistant_NA", RepairWorker = "Repair Worker_NA",
             HugoCaptive = "Hugo_NA", RecruiterEnlist = "Marine Recruiter_MF", RecruiterCourse = "Marine Recruiter_MF",
+            DoranPike = "Doran Pike", MineForeman = "Harlan Voss_VO", MineForemanLoaded = "Harlan Voss_VO",
+            WorkshopKeeper = "Bram Hollowell_VO", WorkshopKeeperMold = "Bram Hollowell_VO",
+            KaeldrosTremor = "Kaeldros_VO", KaeldrosStable = "Kaeldros_VO", KaeldrosRegulator = "Kaeldros_VO",
+            KaeldrosApproved = "Kaeldros_VO", KaeldrosOrdersDone = "Kaeldros_VO", KaeldrosRecords = "Kaeldros_VO",
+            KaeldrosFarewell = "Kaeldros_VO", SwordTraveler = "Edric Vale_VO",
+            CaravanWorker = "Marta Quill_VO", SpearGuard = "Sera Dunmore_VO",
+            PawnbrokerMap = "Pawnbroker",
         }
         local mapped = GameClient._TalkNpcMap[npcBase]
         if not mapped then
@@ -6432,6 +6573,7 @@ local function resolveDirectObjectivePoint(obj)
                     { "^GateGuard", "Prison Gate Guard" }, { "^Commander", "Commander Daskel" },
                     { "^Messenger", "Upper Messenger" }, { "^Resident", "Lower Resident" },
                     { "^Mechanic", "Lower Mechanic" }, { "^Askard", "Askard" },
+                    { "^Kaeldros", "Kaeldros_VO" },
                 }
                 for _, pm in ipairs(GameClient._TalkPrefixMap) do
                     if npcBase:match(pm[1]) then
@@ -6658,6 +6800,7 @@ local function resolveObjectivePoint(obj)
     -- 1) Se ambos estão dentro do mesmo interior (ou na mesma sala subterrânea Y < -200 dentro de 700 studs),
     -- JÁ estamos no ambiente correto! Evita mismatch quando a sala só carregou parcialmente no streaming.
     if (playerInterior and targetInterior and playerInterior == targetInterior)
+        or (myHrp and directPos and myHrp.Position.Y < -8000 and directPos.Y < -8000)
         or (myHrp and directPos and myHrp.Position.Y < -200 and directPos.Y < -200
             and (myHrp.Position - directPos).Magnitude < 700 and math.abs(myHrp.Position.Y - directPos.Y) < 180) then
         return directPos, false
@@ -7127,9 +7270,13 @@ Movement.TryMirrorKeeperTravel = function(destPos, targetIslandName, abortIf)
         LogDebug("mirror_debug.txt", ("ATTEMPT_%d: send Travel"):format(attempt))
         local dlg = GameClient.GetDialogueClient and GameClient.GetDialogueClient()
         if dlg and type(dlg.GetBlockReason) == "function" then
-            local okBlk, blkReason = pcall(dlg.GetBlockReason, "Mirror Keeper")
+            local okBlk, blkReason = pcall(dlg.GetBlockReason)
             if okBlk and blkReason then
                 LogDebug("mirror_debug.txt", ("DIALOGUE_BLOCKED reason=%s"):format(tostring(blkReason)))
+                if blkReason == "Converse" then
+                    local stP = GameModules and GameModules.States and GameModules.States.Player and GameModules.States.Player()
+                    if stP and stP.Set then pcall(stP.Set, stP, "Converse", false) end
+                end
             end
         end
         local okTravel, errTravel = GameClient.Converse("Mirror Keeper", "Travel", targetArea.Name)
@@ -7620,7 +7767,14 @@ local function currentHistoryObjective(info, prog)
                 for _, obj in ipairs(sq.Objectives) do
                     local ok, res = pcall(MainModules.QuestsUtils.IsObjectiveActive, qp, obj.ObjectiveID)
                     if ok and res == true then
-                        table.insert(pending, obj)
+                        local valid = true
+                        if MainModules.QuestsUtils.IsValidObjective then
+                            local okV, resV = pcall(MainModules.QuestsUtils.IsValidObjective, LP, obj)
+                            if okV and resV == false then valid = false end
+                        end
+                        if valid then
+                            table.insert(pending, obj)
+                        end
                     end
                 end
                 if #pending > 0 then
@@ -7870,7 +8024,7 @@ local function storyLoop(mode)
         while not aborted() do
             local char, hrp, hum = getChar()
             local pgNow = LP:FindFirstChild("PlayerGui")
-            if pgNow and (pgNow:FindFirstChild("DodgeMinigameGui") or pgNow:FindFirstChild("StoneBreakGui")) then
+            if pgNow and (pgNow:FindFirstChild("DodgeMinigameGui") ~= nil or pgNow:FindFirstChild("StoneBreakGui") ~= nil or pgNow:FindFirstChild("MiningGui") ~= nil or pgNow:FindFirstChild("ForgeMinigameHud") ~= nil) then
                 attackGoal = nil
                 currentTarget = nil
                 cancelTween()
@@ -7896,6 +8050,84 @@ local function storyLoop(mode)
                     qName, info, prog = activeSecondaryQuest(skippedSec)
                 else
                     qName, info, prog = activeHistoryQuest()
+                end
+                local carryingSellableChest = false
+                if isSec and char:GetAttribute("CarriedChest") ~= nil then
+                    carryingSellableChest = true
+                    if MainModules and MainModules.ChestsUtils and MainModules.ChestsUtils.GetCarriedChest and MainModules.ChestsUtils.IsSellable then
+                        local okSell, resSell = pcall(function()
+                            local chModel = MainModules.ChestsUtils.GetCarriedChest(char)
+                            return chModel ~= nil and MainModules.ChestsUtils.IsSellable(chModel) == true
+                        end)
+                        if okSell then
+                            carryingSellableChest = resSell
+                        end
+                    end
+                end
+                if carryingSellableChest then
+                    local function resolvePawnbrokerPos()
+                        local okP, pPos = pcall(function()
+                            local shops = workspace.IgnoreList.Int.NPCs:FindFirstChild("Shops")
+                            local ct = shops and shops:FindFirstChild("Central Town")
+                            local pb = ct and ct:FindFirstChild("Pawnbroker")
+                            return pb and extractVec3(pb) or nil
+                        end)
+                        if okP and pPos then return pPos, true end
+                        local gp = giverPos("Pawnbroker") or extractVec3(GameClient.GetInterestPoint("Pawnbroker_Harbor Island")) or extractVec3(GameClient.GetInterestPoint("Character_Pawnbroker"))
+                        if gp then return gp, true end
+                        local areasF = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Areas")
+                        local hi = areasF and areasF:FindFirstChild("Harbor Island")
+                        local center = hi and hi:GetAttribute("MapCenter")
+                        if typeof(center) == "Vector3" then
+                            return center + Vector3.new(0, (hi:GetAttribute("MapAltitude") or 14) + 12, 0), false
+                        end
+                        return Vector3.new(5872, 20, 3491), false
+                    end
+                    local pbPos = resolvePawnbrokerPos()
+                    local _, hChest = getChar()
+                    if hChest and pbPos then
+                        if (hChest.Position - pbPos).Magnitude > 1800 then
+                            Status = "Secundárias: levando baú de barco ao Pawnbroker..."
+                            local boat = BoatSystem.FindOwnedBoat()
+                            if not boat then
+                                GameClient.FireNet("Chests", "DropChest", hChest.CFrame)
+                                task.wait(0.6)
+                                boat = BoatSystem.SpawnOnWater(hChest.Position, aborted, pbPos)
+                                BoatSystem.PickupChestFromBoat(aborted)
+                            end
+                            if boat and not aborted() then
+                                BoatSystem.PutChestOnBoat(boat, aborted)
+                                BoatSystem.SailTo(boat, pbPos, aborted)
+                                BoatSystem.PickupChestFromBoat(aborted)
+                            end
+                        end
+                        if not aborted() and LP.Character and LP.Character:GetAttribute("CarriedChest") ~= nil then
+                            local exactPos = resolvePawnbrokerPos()
+                            Status = "Secundárias: entregando baú ao Pawnbroker..."
+                            goNear(exactPos, aborted, { noMirror = true })
+                            if not aborted() then
+                                exactPos = resolvePawnbrokerPos()
+                                local _, hSell = getChar()
+                                if hSell and (hSell.Position - exactPos).Magnitude > 6 then
+                                    BoatSystem.WalkTo(exactPos, aborted, 6)
+                                end
+                                GameClient.Converse("Pawnbroker", "Sell", "Solo")
+                                local tSell = os.clock()
+                                while not aborted() and os.clock() - tSell < 2.0 do
+                                    if not (LP.Character and LP.Character:GetAttribute("CarriedChest") ~= nil) then
+                                        break
+                                    end
+                                    task.wait(0.2)
+                                end
+                                if not aborted() and LP.Character and LP.Character:GetAttribute("CarriedChest") ~= nil then
+                                    GameClient.talkToNPC("Pawnbroker", exactPos, aborted)
+                                    GameClient.drainConverseUI(aborted, 8)
+                                end
+                            end
+                        end
+                    end
+                    task.wait(0.35)
+                    continue
                 end
                 if not qName then
                     -- No active quest: try to accept the next one
@@ -8084,9 +8316,10 @@ local function storyLoop(mode)
                                                 local portalPos = portalFolder and extractVec3(portalFolder:FindFirstChild("Entrance"))
                                                 local refPos = wantEnter and (extractVec3(ent and ent:FindFirstChild("Destination")) or extractVec3(lve and lve:FindFirstChild("Entrance"))) or portalPos
                                                 local cmpPos = wantEnter and npcPos or hPort.Position
+                                                local maxRadius = (placeF.Name == "VolcanoInterior") and 1600 or bestDist
                                                 if portalPos and refPos then
                                                     local d = (refPos - cmpPos).Magnitude
-                                                    if d < bestDist then
+                                                    if d < maxRadius then
                                                         bestDist, bestPortal = d, placeF
                                                     end
                                                 end
@@ -8169,11 +8402,18 @@ local function storyLoop(mode)
                             end
                             local _, hAfterP = getChar()
                             logSec(("afterPortal hAfterP=%s"):format(hAfterP and string.format("(%.1f,%.1f,%.1f)", hAfterP.Position.X, hAfterP.Position.Y, hAfterP.Position.Z) or "nil"))
+                            if isSec and nextName == "The Lost Tool Bag" and hPort and hPort.Position.Y > -200 then
+                                Movement.UseVolcanoPrivateDoor("VolcanoInterior", "Enter", aborted)
+                                hAfterP = select(2, getChar())
+                            end
                             if not (hAfterP and ((hAfterP.Position.Y > -200 and npcPos.Y < -200) or (hAfterP.Position.Y < -200 and npcPos.Y > -200))) then
                                 GameClient.talkToNPC("", npcPos, aborted)
                                 if isSec and nextName == "The Champion's Armor" then
                                     GameClient.Converse("ValoriaBlacksmith", "AcceptArmor")
                                     task.wait(0.4)
+                                elseif isSec and nextName == "The Lost Tool Bag" then
+                                    GameClient.Converse("DoranPike_SQ", "Accept")
+                                    task.wait(0.5)
                                 end
                             end
                             if isSec and not questGivers[nextName] and firstNpc and firstNpc.ObjectiveID then
@@ -8441,13 +8681,15 @@ local function storyLoop(mode)
                         -- Navigate to objective position (tight threshold so distance checks like BilheteJester <= 4.5 studs pass)
                         if pos then
                             pcall(function() LP:RequestStreamAroundAsync(pos) end)
-                            local isChestQuest = (oid == "Find_TreasureX" or oid == "Talk_OrangeTownTrainer_Treasure")
+                            local isChestQuest = (oid == "Find_TreasureX" or oid == "Talk_OrangeTownTrainer_Treasure" or oid:sub(1, 4) == "Dig_" or oid:sub(1, 8) == "Unearth_" or oid:sub(1, 5) == "Sail_" or oid:sub(1, 8) == "Salvage_")
                             local hasChest = LP.Character and LP.Character:GetAttribute("CarriedChest") ~= nil
                             -- 1) ANTES de pegar/escavar o baú: já coloca o barco na água aberta perto da ilha (com ferramentas destravadas!)
                             if isChestQuest and not hasChest then
                                 local curBoat = BoatSystem.FindOwnedBoat()
                                 if not curBoat or (curBoat:GetPivot().Position - pos).Magnitude > 1600 then
-                                    local chestDest = giverPos("Brutus (Treinador dos Piratas do Bugg)")
+                                    local chestDest = (oid == "Find_TreasureX" or oid == "Talk_OrangeTownTrainer_Treasure")
+                                        and giverPos("Brutus (Treinador dos Piratas do Bugg)")
+                                        or (giverPos("Pawnbroker") or Vector3.new(5872, 20, 3491))
                                     BoatSystem.SpawnOnWater(pos, aborted, chestDest)
                                 end
                             end
@@ -8519,7 +8761,7 @@ local function storyLoop(mode)
                             local ctxPre = icPre and icPre.Interaction and icPre.Interaction.Contexts and icPre.Interaction.Contexts[oid]
                             local navThresh = (ctxPre ~= nil) and 12 or 4.5
                             local pullingCart = (oid == "Deliver_SupplyCart_VAL" and LP:GetAttribute("ValoriaCartState") == "Pulling") or ((oid == "Deliver_CargoInspection_SU" or oid == "Deliver_CargoDepot_SU") and LP:GetAttribute("SkylandsCartState") == "Pulling")
-                            local isStealthTail = (oid:sub(1, 7) == "Follow_" or oid == "Capture_Officer_SU" or oid == "Watch_TransferDoor_SU" or oid == "Unload_CargoTools_SU" or oid == "Unload_CargoParts_SU" or oid == "Unload_CargoChest_SU" or oid == "Escort_ArchivistThrone_SU" or oid == "Escort_ArchivistAudience_SU" or oid == "Escort_ArchivistRest_SU" or oid:sub(1, 11) == "Talk_Raikan" or oid:sub(1, 12) == "Start_Raikan" or oid == "Escort_KaeldrosForge_VO" or oid == "Chase_MaskedMan_NA")
+                            local isStealthTail = (oid:sub(1, 7) == "Follow_" or oid == "Capture_Officer_SU" or oid == "Watch_TransferDoor_SU" or oid == "Unload_CargoTools_SU" or oid == "Unload_CargoParts_SU" or oid == "Unload_CargoChest_SU" or oid == "Escort_ArchivistThrone_SU" or oid == "Escort_ArchivistAudience_SU" or oid == "Escort_ArchivistRest_SU" or oid:sub(1, 11) == "Talk_Raikan" or oid:sub(1, 12) == "Start_Raikan" or oid == "Escort_KaeldrosForge_VO" or oid == "Chase_MaskedMan_NA" or oid == "Deposit_VolcanoOre_VO")
                             if oid == "Infiltrate_RankDepot_MF" and hAfterNav and (hAfterNav.Position - pos).Magnitude > navThresh then
                                 -- A rota normal cruza os cones dos guardas. Pela vertical chegamos ao volume final
                                 -- sem atravessar a patrulha; o próprio handler do jogo valida a chegada.
@@ -8880,7 +9122,7 @@ local function storyLoop(mode)
                                 task.wait(0.8)
                             end
 
-                        elseif oid:sub(1, 5) == "Talk_" or oid:sub(1, 4) == "Pay_" then
+                        elseif oid:sub(1, 5) == "Talk_" or oid:sub(1, 4) == "Pay_" or oid == "Deliver_LightSword_VO" or oid == "Deliver_SturdyAxe_VO" or oid == "Deliver_BalancedSpear_VO" then
                             if oid == "Talk_MarineArrest_SOL" then
                                 -- Esta cena não expõe um contexto com o ObjectiveID.
                                 -- O NPC renderizado é MarineOfficer_Hideout e a conversa
@@ -8983,6 +9225,43 @@ local function storyLoop(mode)
                                 end
                                 GameClient.Converse("ValoriaBlacksmith", "DeliverArmor")
                                 task.wait(0.6)
+                            elseif oid == "Talk_DoranPike_SQ" then
+                                local talkPos = giverPos("Doran Pike") or pos
+                                if talkPos then
+                                    tweenTo(CFrame.new(talkPos + Vector3.new(0, 2, 3)), aborted)
+                                    task.wait(0.2)
+                                end
+                                GameClient.Converse("DoranPike_SQ", "Talk_DoranPike_SQ")
+                                task.wait(0.6)
+                            elseif oid == "Talk_PawnbrokerMap" then
+                                local talkPos = giverPos("Pawnbroker") or pos
+                                if talkPos then
+                                    tweenTo(CFrame.new(talkPos + Vector3.new(0, 2, 3)), aborted)
+                                    task.wait(0.2)
+                                end
+                                GameClient.InvokeConverse(5, "Pawnbroker", "IntroMap")
+                                task.wait(0.5)
+                                if GameClient.isObjActive(nil, oid) and not aborted() and talkPos then
+                                    GameClient.talkToNPC("Pawnbroker", talkPos, aborted)
+                                    GameClient.drainConverseUI(aborted, 8)
+                                end
+                            elseif oid == "Deliver_LightSword_VO" or oid == "Deliver_SturdyAxe_VO" or oid == "Deliver_BalancedSpear_VO" then
+                                local npcMap = {
+                                    Deliver_LightSword_VO = { "Edric Vale_VO", "SwordTraveler_VO" },
+                                    Deliver_SturdyAxe_VO = { "Marta Quill_VO", "CaravanWorker_VO" },
+                                    Deliver_BalancedSpear_VO = { "Sera Dunmore_VO", "SpearGuard_VO" },
+                                }
+                                local pair = npcMap[oid]
+                                local talkPos = (pair and giverPos(pair[1])) or pos
+                                if talkPos then
+                                    GameClient.talkToNPC(pair[1], talkPos, aborted)
+                                end
+                                if GameClient.isObjActive(nil, oid) and not aborted() and pair then
+                                    GameClient.Converse(pair[2], oid)
+                                    task.wait(0.4)
+                                    GameClient.drainConverseUI(aborted, 8)
+                                end
+                                task.wait(0.4)
                             elseif oid == "Talk_TomatoClownReward_SQ" then
                                 local talkPos = giverPos("Tomato Clown") or pos
                                 if talkPos then
@@ -9709,6 +9988,17 @@ local function storyLoop(mode)
                                 logIce(("post-fallback active=%s"):format(tostring(GameClient.isObjActive(nil, oid))))
                             end
 
+                        elseif oid:sub(1, 15) == "Break_VentRock_" then
+                            Status = ("História: quebrando rocha (%s)..."):format(oid:match("%d+$") or "?")
+                            local firedVent = GameClient.fireInteractionContext(oid)
+                            if not firedVent then
+                                GameClient.FireNet("QuestZones", oid, "Strike")
+                            end
+                            local tVent = os.clock()
+                            while not aborted() and GameClient.isObjActive(nil, oid) and os.clock() - tVent < 4.0 do
+                                task.wait(0.2)
+                            end
+
                         elseif oid:sub(1, 6) == "Break_" or oid == "Train_VoxArmor_VX" then
                             local breakZone = (oid == "Train_VoxArmor_VX") and "Break_Stone_HK_1" or oid
                             -- A pedra valida socos: remove Sword/Fruit/Gun antes de iniciar.
@@ -9832,8 +10122,7 @@ local function storyLoop(mode)
                                 return res
                             end
                             local function pullLink(idx)
-                                local tOid = "Align_ConductorLink_SU_" .. idx
-                                Status = ("História: testando alavanca %d..."):format(idx)
+                                local tOid = "Align_ConductorLink_SU_" .. tostring(idx)
                                 local lPos = GameClient.findQuestZonePos(tOid)
                                 local _, hL = getChar()
                                 if lPos and hL and (hL.Position - lPos).Magnitude > 3.5 then
@@ -9846,9 +10135,9 @@ local function storyLoop(mode)
                                     task.wait(1.65)
                                 end
                                 if GameClient.isObjActive(nil, tOid) and not aborted() then
-                                    pcall(function() GameModules.Network:FireServer("QuestZones", tOid, "Start") end)
+                                    GameClient.FireNet("QuestZones", tOid, "Start")
                                     task.wait(1.4)
-                                    pcall(function() GameModules.Network:FireServer("QuestZones", tOid, "Use") end)
+                                    GameClient.FireNet("QuestZones", tOid, "Use")
                                     task.wait(0.45)
                                 end
                             end
@@ -9859,6 +10148,14 @@ local function storyLoop(mode)
                                 if #act == 3 then
                                     if firstOk and GameClient.isObjActive(nil, "Align_ConductorLink_SU_" .. firstOk) then
                                         pick = firstOk
+                                    else
+                                        for _, n in ipairs(act) do
+                                            if not tried3[n] then
+                                                pick = n
+                                                break
+                                            end
+                                        end
+                                        pick = pick or act[1]
                                     end
                                     tried3[pick] = true
                                     pullLink(pick)
@@ -10080,6 +10377,229 @@ local function storyLoop(mode)
                                     task.wait(0.35)
                                 end
                                 RunService.Heartbeat:Wait()
+                            end
+
+                        elseif oid == "Collect_ToolBag_SQ" then
+                            local _, hBag = getChar()
+                            if hBag and hBag.Position.Y > -200 then
+                                Status = "Secundárias: entrando no Vulcão..."
+                                Movement.UseVolcanoPrivateDoor("VolcanoInterior", "Enter", aborted)
+                                task.wait(0.3)
+                            end
+                            local bagPos = resolveDirectObjectivePoint(obj) or pos
+                            local _, hBag2 = getChar()
+                            if bagPos and hBag2 and (hBag2.Position - bagPos).Magnitude > 5 then
+                                Status = "Secundárias: indo até a mochila de ferramentas..."
+                                tweenTo(CFrame.new(bagPos + Vector3.new(0, 2, 0)), aborted)
+                                task.wait(0.2)
+                            end
+                            if not aborted() then
+                                Status = "Secundárias: coletando mochila de ferramentas..."
+                                local firedBag = GameClient.fireInteractionContext("Collect_ToolBag_SQ")
+                                if firedBag then
+                                    local tBag = os.clock()
+                                    while not aborted() and GameClient.isObjActive(nil, oid) and os.clock() - tBag < 2.2 do
+                                        task.wait(0.15)
+                                    end
+                                end
+                                if GameClient.isObjActive(nil, oid) and not aborted() then
+                                    GameClient.FireNet("QuestZones", "Collect_ToolBag_SQ", "Start")
+                                    task.wait(1.5)
+                                    GameClient.FireNet("QuestZones", "Collect_ToolBag_SQ", "Use")
+                                    task.wait(0.6)
+                                end
+                            end
+
+                        elseif oid == "Deposit_VolcanoOre_VO" then
+                            local _, hOre = getChar()
+                            if hOre and hOre.Position.Y > -200 then
+                                Status = "História: entrando no Vulcão..."
+                                Movement.UseVolcanoPrivateDoor("VolcanoInterior", "Enter", aborted)
+                                task.wait(0.3)
+                            else
+                                local hasPick = false
+                                pcall(function()
+                                    hasPick = MainModules and MainModules.ToolsUtils and MainModules.ToolsUtils.GetOwnedAmount(nil, "Basic Pickaxe") >= 1
+                                end)
+                                if not hasPick then
+                                    local bagDone = false
+                                    pcall(function()
+                                        local r = MainModules and MainModules.QuestsUtils and MainModules.QuestsUtils.QuestIsCompleted(LP, "The Lost Tool Bag")
+                                        bagDone = (r == true) or (type(r) == "number" and r > 0)
+                                    end)
+                                    if bagDone then
+                                        Status = "História: pegando picareta com Doran..."
+                                        local dPos = giverPos("Doran Pike")
+                                        local _, hD = getChar()
+                                        if dPos and hD and (hD.Position - dPos).Magnitude > 8 then
+                                            tweenTo(CFrame.new(dPos + Vector3.new(0, 2, 3)), aborted)
+                                        end
+                                        GameClient.Converse("DoranPike_SQ", "Pickaxe")
+                                        task.wait(0.8)
+                                    elseif GameClient.isObjActive(nil, "Talk_DoranPike_SQ") then
+                                        Status = "História: entregando mochila para Doran..."
+                                        local dPos = giverPos("Doran Pike")
+                                        local _, hD = getChar()
+                                        if dPos and hD and (hD.Position - dPos).Magnitude > 8 then
+                                            tweenTo(CFrame.new(dPos + Vector3.new(0, 2, 3)), aborted)
+                                        end
+                                        GameClient.Converse("DoranPike_SQ", "Talk_DoranPike_SQ")
+                                        task.wait(0.8)
+                                    elseif GameClient.isObjActive(nil, "Collect_ToolBag_SQ") then
+                                        Status = "História: coletando mochila de Doran..."
+                                        local bagPos = resolveDirectObjectivePoint({ ObjectiveID = "Collect_ToolBag_SQ" })
+                                        local _, hB = getChar()
+                                        if bagPos and hB and (hB.Position - bagPos).Magnitude > 5 then
+                                            tweenTo(CFrame.new(bagPos + Vector3.new(0, 2, 0)), aborted)
+                                        end
+                                        if not aborted() then
+                                            GameClient.FireNet("QuestZones", "Collect_ToolBag_SQ", "Start")
+                                            task.wait(1.5)
+                                            GameClient.FireNet("QuestZones", "Collect_ToolBag_SQ", "Use")
+                                            task.wait(0.8)
+                                        end
+                                    else
+                                        Status = "História: aceitando The Lost Tool Bag (picareta)..."
+                                        local dPos = giverPos("Doran Pike")
+                                        local _, hD = getChar()
+                                        if dPos and hD and (hD.Position - dPos).Magnitude > 8 then
+                                            tweenTo(CFrame.new(dPos + Vector3.new(0, 2, 3)), aborted)
+                                        end
+                                        GameClient.Converse("DoranPike_SQ", "Accept")
+                                        task.wait(0.8)
+                                    end
+                                else
+                                    local carried = math.max(0, math.floor(tonumber(LP:GetAttribute("VolcanoOreCarried")) or 0))
+                                    local qpOre = GameClient.getQuestClientProgress()
+                                    local remOre = (qpOre and type(qpOre.ObjectiveIds) == "table" and tonumber(qpOre.ObjectiveIds["Deposit_VolcanoOre_VO"])) or 15
+                                    if carried >= 5 or (carried > 0 and carried >= remOre) then
+                                        Status = ("História: descarregando minério (%d)..."):format(carried)
+                                        local cartPos = resolveDirectObjectivePoint(obj) or pos
+                                        local _, hCart = getChar()
+                                        if cartPos and hCart and (hCart.Position - cartPos).Magnitude > 6 then
+                                            tweenTo(CFrame.new(cartPos + Vector3.new(0, 2, 2)), aborted)
+                                            task.wait(0.2)
+                                        end
+                                        if not aborted() then
+                                            local firedCart = GameClient.fireInteractionContext("Deposit_VolcanoOre_VO")
+                                            if not firedCart then
+                                                GameClient.FireNet("QuestZones", "Deposit_VolcanoOre_VO", "Unload")
+                                            end
+                                            local tUnload = os.clock()
+                                            while not aborted() and os.clock() - tUnload < 3.5 do
+                                                if (tonumber(LP:GetAttribute("VolcanoOreCarried")) or 0) <= 0 then break end
+                                                task.wait(0.2)
+                                            end
+                                        end
+                                    else
+                                        local miningMod = nil
+                                        pcall(function()
+                                            miningMod = require(ReplicatedStorage.Modules.Addons.MinigamesSystem["MinigamesSystem Client"]["MiningMinigame Client"])
+                                        end)
+                                        local rockIdx, rockModel = nil, nil
+                                        if miningMod and miningMod.FindNearestRock and hOre then
+                                            rockIdx, rockModel = miningMod.FindNearestRock(hOre.Position, 600)
+                                        end
+                                        if rockIdx and rockModel then
+                                            local rockPos = extractVec3(rockModel)
+                                            if rockPos then
+                                                Status = ("História: minerando rocha %d (%d/5)..."):format(rockIdx, carried)
+                                                tweenTo(CFrame.new(rockPos + Vector3.new(0, 2, 4)), aborted)
+                                                task.wait(0.2)
+                                                if not aborted() then
+                                                    GameClient.FireNet("QuestZones", "VolcanoMine_VO", "Mine", rockIdx)
+                                                    local tStartM = os.clock()
+                                                    while not aborted() and os.clock() - tStartM < 2.5 do
+                                                        local pgM = LP:FindFirstChild("PlayerGui")
+                                                        if (miningMod and miningMod.IsRunning and miningMod.IsRunning()) or (pgM and pgM:FindFirstChild("MiningGui")) then
+                                                            break
+                                                        end
+                                                        task.wait(0.15)
+                                                    end
+                                                    local tMine = os.clock()
+                                                    while not aborted() and os.clock() - tMine < 25 do
+                                                        local pgM = LP:FindFirstChild("PlayerGui")
+                                                        local runningM = (miningMod and miningMod.IsRunning and miningMod.IsRunning()) or (pgM and pgM:FindFirstChild("MiningGui") ~= nil)
+                                                        if not runningM then break end
+                                                        task.wait(0.2)
+                                                    end
+                                                end
+                                            end
+                                        else
+                                            Status = "História: aguardando rocha regenerar..."
+                                            task.wait(0.6)
+                                        end
+                                    end
+                                end
+                            end
+
+                        elseif oid == "Forge_Regulator_VO" or oid == "Forge_LightSword_VO" or oid == "Forge_SturdyAxe_VO" or oid == "Forge_BalancedSpear_VO" or oid == "Repair_NautiliaKey_VO" then
+                            local recipeMap = {
+                                Forge_Regulator_VO = "Regulator",
+                                Forge_LightSword_VO = "LightSword",
+                                Forge_SturdyAxe_VO = "SturdyAxe",
+                                Forge_BalancedSpear_VO = "BalancedSpear",
+                                Repair_NautiliaKey_VO = "NautiliaKey",
+                            }
+                            local recipeId = recipeMap[oid]
+                            local _, hFg = getChar()
+                            if hFg and hFg.Position.Y > -200 then
+                                Status = "História: entrando no Vulcão..."
+                                Movement.UseVolcanoPrivateDoor("VolcanoInterior", "Enter", aborted)
+                                task.wait(0.3)
+                            else
+                                local forgePos = resolveDirectObjectivePoint(obj) or pos
+                                if forgePos and hFg and (hFg.Position - forgePos).Magnitude > 8 then
+                                    Status = ("História: indo para a forja (%s)..."):format(recipeId)
+                                    tweenTo(CFrame.new(forgePos + Vector3.new(0, 2, 3)), aborted)
+                                    task.wait(0.25)
+                                end
+                                if not aborted() and recipeId then
+                                    Status = ("História: forjando %s..."):format(recipeId)
+                                    GameClient.FireNet("QuestZones", "StoryForge_VO", "Use", recipeId)
+                                    local msClient, forgeRecipes = nil, nil
+                                    pcall(function()
+                                        msClient = require(ReplicatedStorage.Modules.Addons.MinigamesSystem).IsClient
+                                        forgeRecipes = require(ReplicatedStorage.Modules.Addons.MinigamesSystem.ForgeRecipes)
+                                    end)
+                                    local activeId = nil
+                                    local tStartF = os.clock()
+                                    while not aborted() and os.clock() - tStartF < 4.5 do
+                                        if msClient and msClient.Active and msClient.Active.Name == "Forge" and msClient.Active.Id then
+                                            activeId = msClient.Active.Id
+                                            break
+                                        end
+                                        task.wait(0.15)
+                                    end
+                                    if activeId and not aborted() then
+                                        local recipeObj = forgeRecipes and forgeRecipes.Get and forgeRecipes.Get(recipeId)
+                                        local minDur = (forgeRecipes and forgeRecipes.MinDuration and recipeObj and forgeRecipes.MinDuration(recipeObj)) or 18
+                                        local waitUntil = os.clock() + minDur + 1.0
+                                        while not aborted() and GameClient.isObjActive(nil, oid) and os.clock() < waitUntil do
+                                            if not (msClient and msClient.Active and msClient.Active.Id == activeId) then
+                                                break
+                                            end
+                                            Status = ("História: forjando %s (%ds)..."):format(recipeId, math.max(1, math.ceil(waitUntil - os.clock())))
+                                            task.wait(0.3)
+                                        end
+                                        if not aborted() and GameClient.isObjActive(nil, oid) and msClient and msClient.Active and msClient.Active.Id == activeId then
+                                            local strikes = (recipeObj and recipeObj.Strikes) or 8
+                                            local grades = table.create(strikes, "Perfect")
+                                            GameClient.FireNet("MinigamesService", "Forge", {
+                                                GameAction = "End",
+                                                id = activeId,
+                                                Heat = 100,
+                                                Pour = 100,
+                                                Hammer = 100,
+                                                Grades = grades,
+                                            })
+                                            task.wait(1.5)
+                                            if msClient and msClient.Active and msClient.Active.Id == activeId and msClient.StopActive then
+                                                pcall(msClient.StopActive, msClient, { reason = "FINISHED" })
+                                            end
+                                        end
+                                    end
+                                end
                             end
 
                         else
@@ -10546,17 +11066,19 @@ function GameClient.BossLoop()
                             end
                             local beaconNode = beacons and beacons:FindFirstChild(chosenName)
                             local beaconPos = beaconNode and Features.ExtractVec3(beaconNode)
-                            if beaconPos and (hrp.Position - beaconPos).Magnitude < 1800 then
-                                -- Já está perto da ilha do boss: sai de eventual interior e vai até o beacon para carregar o modelo
+                            local tpCfg = MainModules and MainModules.ConditionalSpawnsSettings and MainModules.ConditionalSpawnsSettings.Teleport
+                            local tpMinLv = (tpCfg and tonumber(tpCfg.MinLevel)) or 325
+                            if beaconPos and ((hrp.Position - beaconPos).Magnitude < 1800 or lvl < tpMinLv) then
+                                -- Já está perto da ilha do boss (ou abaixo do nível mínimo do TP): vai até o beacon para carregar o modelo
                                 tryAcceptBossQuest(chosenName, lvl)
                                 Status = ("Boss: indo até %s..."):format(chosenName)
-                                logBoss(("BEACON_NEAR boss=%s dist=%.1f"):format(chosenName, (hrp.Position - beaconPos).Magnitude))
+                                LogDebug("boss_debug.txt", ("BEACON_NEAR boss=%s dist=%.1f lv=%d"):format(chosenName, (hrp.Position - beaconPos).Magnitude, lvl))
                                 goNear(beaconPos, function()
                                     return bossActionAborted() or findWorldBoss(chosenName) ~= nil
                                 end)
                                 task.wait(0.4)
                             else
-                                local cd = (MainModules and MainModules.ConditionalSpawnsSettings and MainModules.ConditionalSpawnsSettings.Teleport and MainModules.ConditionalSpawnsSettings.Teleport.Cooldown) or 30
+                                local cd = (tpCfg and tonumber(tpCfg.Cooldown)) or 30
                                 local elapsed = os.clock() - State.lastBossTp
                                 if elapsed < cd + 1 then
                                     local rem = math.ceil((cd + 1) - elapsed)
@@ -10569,7 +11091,7 @@ function GameClient.BossLoop()
                                     local distBefore = beaconPos and (hrp.Position - beaconPos).Magnitude or -1
                                     logBoss(("TP_FIRE boss=%s distBefore=%.1f"):format(chosenName, distBefore))
                                     State.lastBossTp = os.clock()
-                                    pcall(function() GameModules.Network:FireServer("BossTeleport", chosenName) end)
+                                    GameClient.FireNet("BossTeleport", chosenName)
                                     task.wait(2.5)
                                     local _, hAfterTp = getChar()
                                     local bAfter = beacons and beacons:FindFirstChild(chosenName)
@@ -10730,6 +11252,7 @@ function GameClient.IslandBossLoop()
         LogDebug("boss_debug.txt", ("=== AutoIslandBoss START lv=%d ==="):format(getLevel()))
         local idx = 1
         local cooldownUntil = {}
+        local voidSummonCooldownUntil = 0
         local function aborted()
             return not CFG.AutoIslandBoss or State.islandBossToken ~= my
         end
@@ -10785,7 +11308,7 @@ function GameClient.IslandBossLoop()
                                 if bName == "VoidWalker Mordrek" then
                                     local beacons = dataF and dataF:FindFirstChild("BossBeacons")
                                     local hasBeacon = beacons and beacons:FindFirstChild(bName) ~= nil
-                                    local canSpawnWithKey = CFG.UseVoidWalkerKey and hasVoidWalkerKey()
+                                    local canSpawnWithKey = CFG.UseVoidWalkerKey and hasVoidWalkerKey() and now >= voidSummonCooldownUntil
                                     if not hasBeacon and not canSpawnWithKey then
                                         skipRemote = true
                                     end
@@ -10820,6 +11343,7 @@ function GameClient.IslandBossLoop()
                             else
                                 dest = islandBossPos(chosen, hrp.Position)
                             end
+                            local triedVoidSummon = false
                             if dest then
                                 Status = ("Boss Ilha: indo até %s..."):format(chosen)
                                 goNear(dest, function() return actAborted() or findWorldBoss(chosen) ~= nil end)
@@ -10831,6 +11355,7 @@ function GameClient.IslandBossLoop()
                                     end
                                     if not actAborted() and not findWorldBoss(chosen) then
                                         task.wait(1)
+                                        triedVoidSummon = true
                                         LogDebug("island_boss_debug.txt", "SUMMON_VOIDWALKER Elysium_Converse('Void Herald', 'Summon')")
                                         GameClient.Converse("Void Herald", "Summon")
                                     end
@@ -10845,6 +11370,10 @@ function GameClient.IslandBossLoop()
                                 bossName = chosen
                             else
                                 cooldownUntil[chosen] = os.clock() + 15
+                                if triedVoidSummon then
+                                    voidSummonCooldownUntil = os.clock() + 120
+                                    LogDebug("island_boss_debug.txt", "VOID_SUMMON_BACKOFF 120s (provavel cooldown de 30m do servidor)")
+                                end
                                 if #selected == 1 then
                                     State.islandBossBusy = false
                                     if not State.seaBeastBusy and not State.fortRaidBusy and not State.bossBusy then
@@ -11378,7 +11907,7 @@ function GameClient.LootFortRaid(fortFolder, activeFort, aborted, logFort)
         logFort("VAULT_OPEN_REQUEST fort=" .. tostring(activeFort))
         GameClient.fireInteractionContext("MarineFortVault")
         GameClient.pressInteract(0.5, "MarineFortVault")
-        pcall(function() GameModules.Network:FireServer("FortRaid", "OpenVault") end)
+        GameClient.FireNet("FortRaid", "OpenVault")
         local vaultDeadline = os.clock() + 12
         while not aborted() and os.clock() < vaultDeadline and fortFolder:GetAttribute("VaultOpened") ~= true do
             task.wait(0.25)
@@ -11386,7 +11915,7 @@ function GameClient.LootFortRaid(fortFolder, activeFort, aborted, logFort)
     end
     if aborted() or fortFolder:GetAttribute("VaultOpened") ~= true then return end
 
-    pcall(function() GameModules.Network:FireServer("FortRaid", "GetChests") end)
+    GameClient.FireNet("FortRaid", "GetChests")
     local loadDeadline = os.clock() + 5
     while not aborted() and os.clock() < loadDeadline do
         local ignore = workspace:FindFirstChild("IgnoreList")
@@ -12174,33 +12703,44 @@ GameClient.InventoryAutomationNext = 0
 function GameClient.AutoDeleteMaterialStep()
     if not CFG.AutoDeleteInventory then return false end
     local keep = math.max(0, math.floor(tonumber(CFG.InventoryDeleteKeep) or 0))
-    local rows = GameClient.GetContainerRows("Unequiped", "All")
-    table.sort(rows, function(a, b) return a.Index > b.Index end)
     local deletedAny = false
-    for _, row in ipairs(rows) do
+    local failedThisPass = {}
+    for _ = 1, 100 do
         if not CFG.AutoDeleteInventory then break end
-        local before = GameClient.BankAmount("Unequiped", row.Name)
-        local targeted = CFG.InventoryDeleteTargets and CFG.InventoryDeleteTargets[row.Category] and CFG.InventoryDeleteTargets[row.Category][row.Name]
-        if targeted and not row.Locked and before > keep then
-            local amount = math.min(row.Quantity, before - keep)
-            LogDebug("inventory_delete_debug.txt", ("AUTO_DELETE_REQUEST name=%s cat=%s index=%d amount=%d keep=%d before=%d"):format(
-                row.Name, row.Category, row.Index, amount, keep, before
-            ))
-            GameModules.Network:FireServer("ToolsData", "Delete", false, row.Index, row.Name, amount)
-            local deadline, after = os.clock() + 5, before
-            repeat
-                task.wait(0.15)
-                after = GameClient.BankAmount("Unequiped", row.Name)
-            until after <= before - amount or os.clock() >= deadline
-            if after <= before - amount then
-                LogDebug("inventory_delete_debug.txt", ("AUTO_DELETE_CONFIRMED name=%s amount=%d after=%d"):format(row.Name, amount, after))
-                Status = ("Auto excluir: %d × %s"):format(amount, row.Name)
-            else
-                LogDebug("inventory_delete_debug.txt", ("AUTO_DELETE_REJECTED name=%s amount=%d before=%d after=%d"):format(row.Name, amount, before, after))
+        local rows = GameClient.GetContainerRows("Unequiped", "All")
+        table.sort(rows, function(a, b) return (a.Index or 0) > (b.Index or 0) end)
+        local targetRow, targetBefore = nil, 0
+        for _, row in ipairs(rows) do
+            local targeted = CFG.InventoryDeleteTargets and CFG.InventoryDeleteTargets[row.Category] and CFG.InventoryDeleteTargets[row.Category][row.Name]
+            local failKey = tostring(row.Index) .. ":" .. tostring(row.Name)
+            if targeted and not row.Locked and not failedThisPass[failKey] then
+                local before = GameClient.BankAmount("Unequiped", row.Name)
+                if before > keep then
+                    targetRow, targetBefore = row, before
+                    break
+                end
             end
-            deletedAny = true
-            task.wait(0.15)
         end
+        if not targetRow then break end
+        local amount = math.min(targetRow.Quantity, targetBefore - keep)
+        LogDebug("inventory_delete_debug.txt", ("AUTO_DELETE_REQUEST name=%s cat=%s index=%d amount=%d keep=%d before=%d"):format(
+            targetRow.Name, targetRow.Category, targetRow.Index, amount, keep, targetBefore
+        ))
+        GameClient.FireNet("ToolsData", "Delete", false, targetRow.Index, targetRow.Name, amount)
+        local deadline, after = os.clock() + 3.0, targetBefore
+        repeat
+            task.wait(0.15)
+            after = GameClient.BankAmount("Unequiped", targetRow.Name)
+        until after <= targetBefore - amount or os.clock() >= deadline
+        if after <= targetBefore - amount then
+            LogDebug("inventory_delete_debug.txt", ("AUTO_DELETE_CONFIRMED name=%s amount=%d after=%d"):format(targetRow.Name, amount, after))
+            Status = ("Auto excluir: %d × %s"):format(amount, targetRow.Name)
+            deletedAny = true
+        else
+            LogDebug("inventory_delete_debug.txt", ("AUTO_DELETE_REJECTED name=%s amount=%d before=%d after=%d"):format(targetRow.Name, amount, targetBefore, after))
+            failedThisPass[tostring(targetRow.Index) .. ":" .. tostring(targetRow.Name)] = true
+        end
+        task.wait(0.15)
     end
     return deletedAny
 end
@@ -12932,7 +13472,7 @@ Features.MissionLoop = function()
                     if curQ ~= nil and curQ ~= missionEntry.name then
                         Status = "Trocando para missão selecionada..."
                         logMob(("QUEST_ABANDON %s -> %s"):format(tostring(curQ), tostring(missionEntry.name)))
-                        pcall(function() GameModules.Network:FireServer("Quests", "Abandon", curQ) end)
+                        GameClient.FireNet("Quests", "Abandon", curQ)
                         task.wait(0.6)
                         shouldContinue = true
                     elseif curQ == nil then
@@ -12944,13 +13484,19 @@ Features.MissionLoop = function()
                             hadActiveQuest = false
                             Status = "Repetindo missão..."
                             local waitEnd = os.clock() + 0.8
-                            local firedManual = false
+                            local firedManual = GameClient.TryNativeRepeatQuest(missionEntry.name)
                             while not mAborted() and os.clock() < waitEnd do
                                 curQ, curInfo, curProg = Features.ActiveQuest()
                                 if curQ == missionEntry.name then break end
                                 if not firedManual and os.clock() >= State.repeatPendingUntil and (waitEnd - os.clock()) <= 0.45 then
-                                    firedManual = true
-                                    pcall(function() GameModules.Network:FireServer("Quests", "Repeat") end)
+                                    firedManual = GameClient.TryNativeRepeatQuest(missionEntry.name)
+                                    if not firedManual then
+                                        local qs = GameClient.GetQuestClient and GameClient.GetQuestClient()
+                                        if not (qs and qs.RepeatQuest) then
+                                            firedManual = true
+                                            GameClient.FireNet("Quests", "Repeat")
+                                        end
+                                    end
                                 end
                                 task.wait(0.15)
                             end
@@ -12999,7 +13545,7 @@ Features.MissionLoop = function()
                                 task.wait(0.3)
                             end
                             if Features.ActiveQuest() == curQ then
-                                pcall(function() GameModules.Network:FireServer("Quests", "Repeat") end)
+                                GameClient.FireNet("Quests", "Repeat")
                             end
                             shouldContinue = true
                         else
@@ -15622,7 +16168,7 @@ do
         end
         task.spawn(function()
             Movement.TagThread("BlackMarketTeleport", 100)
-            local gcf = (bm.GetGroundCFrame and bm.GetGroundCFrame(pt)) or pt.CFrame
+            local gcf = pt.CFrame
             local dest = gcf.Position + gcf.LookVector * 3 + Vector3.new(0, 2, 0)
             Status = "Indo ao Black Market..."
             goNear(dest, function() return isDeadOrRespawning() end)
@@ -15681,7 +16227,7 @@ do
                             LogDebugEvent("blackmarket_debug.txt", "BUY_PLAN", ("items=%d visitKey=%s"):format(#buyPlan, tostring(visitKey)))
                             local snap = Features.PauseForInterrupt and Features.PauseForInterrupt() or nil
                             pcall(function()
-                                local gcf = (bm.GetGroundCFrame and bm.GetGroundCFrame(pt)) or pt.CFrame
+                                local gcf = pt.CFrame
                                 local dest = gcf.Position + gcf.LookVector * 3 + Vector3.new(0, 2, 0)
                                 local buyDist = math.max(12, (tonumber(bm.BuyDistance) or 35) - 5)
                                 Status = "Black Market: indo comprar..."
@@ -17875,3 +18421,4 @@ end, SafeRuntime.Traceback)
 if not okBuildUI then
     SafeRuntime.ReportError("BuildMainUI", errBuildUI)
 end
+GenericInfra.Bootstrap.Finish(okBuildUI)
