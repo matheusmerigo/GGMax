@@ -12176,7 +12176,9 @@ function GameClient.AutoDeleteMaterialStep()
     local keep = math.max(0, math.floor(tonumber(CFG.InventoryDeleteKeep) or 0))
     local rows = GameClient.GetContainerRows("Unequiped", "All")
     table.sort(rows, function(a, b) return a.Index > b.Index end)
+    local deletedAny = false
     for _, row in ipairs(rows) do
+        if not CFG.AutoDeleteInventory then break end
         local before = GameClient.BankAmount("Unequiped", row.Name)
         local targeted = CFG.InventoryDeleteTargets and CFG.InventoryDeleteTargets[row.Category] and CFG.InventoryDeleteTargets[row.Category][row.Name]
         if targeted and not row.Locked and before > keep then
@@ -12196,10 +12198,11 @@ function GameClient.AutoDeleteMaterialStep()
             else
                 LogDebug("inventory_delete_debug.txt", ("AUTO_DELETE_REJECTED name=%s amount=%d before=%d after=%d"):format(row.Name, amount, before, after))
             end
-            return true
+            deletedAny = true
+            task.wait(0.15)
         end
     end
-    return false
+    return deletedAny
 end
 
 function GameClient.AutoBankMaterialBatch()
@@ -12283,7 +12286,7 @@ function GameClient.EnsureInventoryLoop()
                 if wDel then acted = GameClient.AutoDeleteMaterialStep() end
                 local inCombatOrRaid = State.bossBusy or State.islandBossBusy or State.seaBeastBusy or State.fortRaidBusy or State.raidInArena or GameClient.CampfireActive or (GameClient.BossRoomsFight and GameClient.BossRoomsFight.Payload ~= nil)
                 if not acted and wBank and not inCombatOrRaid then acted = GameClient.AutoBankMaterialBatch() end
-                GameClient.InventoryAutomationNext = os.clock() + (acted and 2 or 5)
+                GameClient.InventoryAutomationNext = os.clock() + 30
                 GameClient.InventoryAutomationBusy = false
             end
             task.wait(1)
@@ -17766,7 +17769,7 @@ local function applyAtmosphereState(state)
         local atm = lighting:FindFirstChildOfClass("Atmosphere")
         if atm then
             cachedAtmosphere = atm
-            atm.Parent = nil
+            atm.Parent = nilpor
         end
         local sky = lighting:FindFirstChildOfClass("Sky")
         if sky then
