@@ -1048,6 +1048,7 @@ local CFG = {
     AutoWaterKungFu = false,    -- desbloqueia o estilo Water Kung-Fu automaticamente
     AutoEletric     = false,    -- desbloqueia o estilo Eletric automaticamente
     AutoSkills      = false,    -- usa as teclas marcadas em SkillKeys nos intervalos durante o farm
+    AutoHoldSkills  = true,     -- segura automaticamente skills de carga/hold até perto de MaxTime
     SkillKeys       = { Z = true, X = true, C = true, V = true, F = false, G = false },
     SkillInterval   = 0.4,      -- segundos entre tentativas de skill
     AttackMode      = "M1",       -- "KillAura" (CombatTools/DefaultCombo) ou "M1" (Tool:Activate)
@@ -2656,7 +2657,21 @@ function Features.InitCombatCore()
             if (CFG.AttackMode == "M1" or Combat.ToolIsGun(tool)) and os.clock() - lastHit >= CFG.M1Interval then
                 lastHit = os.clock()
                 tool = (tool and tool.Parent == c2) and tool or Combat.EquipWeapon(c2, c2:FindFirstChildOfClass("Humanoid"))
-                Combat.M1(tool)
+                if Combat.ToolIsGun(tool) then
+                    local trp = target and (target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart)
+                    if trp then
+                        GameClient.FireNet("CombatTools2", "Custom", tool.Name, {
+                            CallTime = workspace:GetServerTimeNow(),
+                            MouseHit = trp.Position,
+                            Combo = 1,
+                            DelayTime = 0.15,
+                        })
+                    else
+                        Combat.M1(tool)
+                    end
+                else
+                    Combat.M1(tool)
+                end
             end
             RunService.Heartbeat:Wait()
         end
@@ -4242,27 +4257,47 @@ function GameClient.EnsureSkillsLoop()
                     end
                     if CFG.AutoSkills and hasLiveSkillTarget() and not collecting and not State.storing and not Combat.IsInCutscene() and not isDeadOrRespawning() then
                         if skillObj and skillObj.Id and GameModules and GameModules.Network then
-                            -- Sequência nativa Call -> Begin -> MinTime -> End -> Release (independente de foco de teclado) + mira no alvo
+                            -- Sequência nativa Call -> Begin -> Hold/MinTime -> End -> Release (independente de foco de teclado) + mira no alvo
+                            local s = skillObj.Settings or {}
+                            local minT = math.max(0.1, tonumber(s.MinTime) or 0.1)
+                            local maxT = tonumber(s.MaxTime)
+                            local isHoldSkill = (type(maxT) == "number" and maxT > (minT + 0.1))
+                            local holdT = (CFG.AutoHoldSkills and isHoldSkill) and math.max(minT + 0.12, maxT - 0.08) or (minT + 0.12)
                             local tgt = currentTarget
                             skillAimTarget = tgt
-                            skillAimUntil = os.clock() + 1.5
-                            Combat.skillCastingUntil = os.clock() + 0.35
-                            skillNext[tSk.Name .. ":" .. keyName] = os.clock() + ((skillObj.Settings and skillObj.Settings.Cooldown) or 2) + 0.25
+                            skillAimUntil = os.clock() + holdT + 1.0
+                            Combat.skillCastingUntil = os.clock() + holdT + 0.25
+                            skillNext[tSk.Name .. ":" .. keyName] = os.clock() + holdT + (tonumber(s.Cooldown) or 2) + 0.25
                             local callRes = nil
                             if skillObj.Client and skillObj.Client.Call then
                                 local okC, cr = pcall(skillObj.Client.Call)
                                 if okC then callRes = cr end
                             end
-                            pcall(function() GameModules.Network:FireServer("Elysium_Casting", "Begin", "Skill", skillObj.Id, callRes) end)
-                            logSkill(("CAST_BEGIN tool=%s key=%s skill=%s target=%s"):format(
-                                tostring(tSk.Name), tostring(keyName), tostring(skillObj.Id), tostring(tgt and baseName(tgt) or "nil")
+                            GameClient.FireNet("Elysium_Casting", "Begin", "Skill", skillObj.Id, callRes)
+                            logSkill(("CAST_BEGIN tool=%s key=%s skill=%s hold=%.2f target=%s"):format(
+                                tostring(tSk.Name), tostring(keyName), tostring(skillObj.Id), holdT, tostring(tgt and baseName(tgt) or "nil")
                             ))
-                            local holdT = math.max(0.1, (skillObj.Settings and skillObj.Settings.MinTime) or 0.1) + 0.12
-                            task.wait(holdT)
-                            if not CFG.AutoSkills or not hasLiveSkillTarget() or collecting or Combat.IsInCutscene() or isDeadOrRespawning() then
-                                pcall(function() GameModules.Network:FireServer("Elysium_Casting", "Cancel", "Skill", skillObj.Id) end)
-                                logSkill(("CAST_CANCEL tool=%s key=%s skill=%s attackGoal=%s"):format(
-                                    tostring(tSk.Name), tostring(keyName), tostring(skillObj.Id), tostring(attackGoal ~= nil)
+                            local holdStart = os.clock()
+                            local holdEnd = holdStart + holdT
+                            while os.clock() < holdEnd do
+                                if not CFG.AutoSkills or not hasLiveSkillTarget() or collecting or Combat.IsInCutscene() or isDeadOrRespawning() then
+                                    break
+                                end
+                                skillAimTarget = currentTarget
+                                if castingClient and castingClient.GetActive and (os.clock() - holdStart) >= 0.2 then
+                                    local okAct, actCast = pcall(castingClient.GetActive, cSk, "Skill", skillObj.Id)
+                                    if okAct and actCast == nil then
+                                        break
+                                    end
+                                end
+                                task.wait(0.08)
+                            end
+                            local elapsed = os.clock() - holdStart
+                            if not CFG.AutoSkills or collecting or Combat.IsInCutscene() or isDeadOrRespawning() or (not hasLiveSkillTarget() and elapsed < minT) then
+                                GameClient.FireNet("Elysium_Casting", "Cancel", "Skill", skillObj.Id)
+                                Combat.skillCastingUntil = os.clock() + 0.15
+                                logSkill(("CAST_CANCEL tool=%s key=%s skill=%s elapsed=%.2f attackGoal=%s"):format(
+                                    tostring(tSk.Name), tostring(keyName), tostring(skillObj.Id), elapsed, tostring(attackGoal ~= nil)
                                 ))
                             else
                                 local cast = castingClient and castingClient.GetActive and castingClient.GetActive(cSk, "Skill", skillObj.Id) or nil
@@ -4271,9 +4306,10 @@ function GameClient.EnsureSkillsLoop()
                                     local okE, er = pcall(skillObj.Client.End, cast)
                                     if okE and er ~= nil then endRes = er end
                                 end
-                                pcall(function() GameModules.Network:FireServer("Elysium_Casting", "Release", "Skill", skillObj.Id, endRes) end)
-                                logSkill(("CAST_RELEASE tool=%s key=%s skill=%s target=%s"):format(
-                                    tostring(tSk.Name), tostring(keyName), tostring(skillObj.Id), tostring(tgt and baseName(tgt) or "nil")
+                                GameClient.FireNet("Elysium_Casting", "Release", "Skill", skillObj.Id, endRes)
+                                Combat.skillCastingUntil = os.clock() + 0.15
+                                logSkill(("CAST_RELEASE tool=%s key=%s skill=%s hold=%.2f target=%s"):format(
+                                    tostring(tSk.Name), tostring(keyName), tostring(skillObj.Id), elapsed, tostring(tgt and baseName(tgt) or "nil")
                                 ))
                             end
                         else
@@ -18218,6 +18254,16 @@ function Shared.BuildMainUI()
                     if VoxCore.Client and VoxCore.Client.EnsureSkillsLoop then
                         VoxCore.Client.EnsureSkillsLoop()
                     end
+                end
+            end,
+        })
+
+        UI.TB_Tabs.Combat.Combat:AddToggle("AutoHoldSkillsActive", {
+            Text = "Auto Hold Skills",
+            Default = true,
+            Callback = function(on)
+                if VoxCore and VoxCore.CFG then
+                    VoxCore.CFG.AutoHoldSkills = (on == true)
                 end
             end,
         })
