@@ -1,2 +1,0 @@
-# GGMax
-Victoria Super Mortem.
