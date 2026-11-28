@@ -121,6 +121,7 @@ local http = http
 local cloneref = cloneref
 local Library
 local SaveManager
+local MirrorSystem
 local LPH_ENCSTR = LPH_ENCSTR or function(value) return value end
 local LPH_NO_VIRTUALIZE = LPH_NO_VIRTUALIZE or function(callback) return callback end
 
@@ -191,11 +192,13 @@ local Shared
 local PreviousRuntimeState = { Unload = GlobalEnv.Midgard_Unload, Library = GlobalEnv.Midgard_Library }
 local HttpInfra = { DiscordRpcUrl = "http://127.0.0.1:6463/rpc?v=1", DiscordRpcOrigin = "https://discord.com" }
 local RepoConfig = {
-    BaseUrl = LPH_ENCSTR("https://raw.githubusercontent.com/matheusmerigo/midgard.ui/refs/heads/main/"),
-    LibraryOverrideUrl = LPH_ENCSTR("https://raw.githubusercontent.com/matheusmerigo/midgard.ui/refs/heads/main/Library.lua"),
-    SaveManagerOverrideUrl = LPH_ENCSTR("https://raw.githubusercontent.com/matheusmerigo/midgard.ui/refs/heads/main/Save%20Manager.lua"),
+    BaseUrl = LPH_ENCSTR("https://raw.githubusercontent.com/matheusmerigo/Oo9JeuG6y8xcGu/refs/heads/main/"),
+    LibraryOverrideUrl = LPH_ENCSTR("https://raw.githubusercontent.com/matheusmerigo/Oo9JeuG6y8xcGu/refs/heads/main/Library.lua"),
+    SaveManagerOverrideUrl = LPH_ENCSTR("https://raw.githubusercontent.com/matheusmerigo/Oo9JeuG6y8xcGu/refs/heads/main/Save%20Manager.lua"),
+    MirrorOverrideUrl = LPH_ENCSTR("https://raw.githubusercontent.com/matheusmerigo/FXkl51k9FYhPJN/refs/heads/main/pZek00%241y%40OKCZ.lua"),
     LibraryPath = "Library.lua",
     SaveManagerPath = "Save%20Manager.lua",
+    MirrorPath = "pZek00%241y%40OKCZ.lua",
 }
 local ClientPublicConfig = { InviteCode = "pW2X3GtveU", AvatarUrl = "https://i.imgur.com/L6ZzYnB.png" }
 local InviteUrl = "https://discord.gg/" .. tostring(ClientPublicConfig.InviteCode or "")
@@ -442,6 +445,27 @@ do
 
     Library = LoadRequired("Library", libraryUrl .. cacheBust)
     SaveManager = LoadRequired("SaveManager", saveManagerUrl .. cacheBust)
+    do
+        local localCandidates = { "Midgard - Mirror.lua", "Mirror.lua", "Midgard  - Vox Seas/Midgard - Mirror.lua", "Midgard  - Vox Seas/Mirror.lua" }
+        if type(isfile) == "function" and type(readfile) == "function" then
+            for _, p in ipairs(localCandidates) do
+                local okExists, exists = pcall(isfile, p)
+                if okExists and exists then
+                    local okRead, src = pcall(readfile, p)
+                    if okRead and type(src) == "string" then
+                        local okLoad, mod = pcall(tryLoadSource, "Mirror", src)
+                        if okLoad and type(mod) == "table" then
+                            MirrorSystem = mod
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        if type(MirrorSystem) ~= "table" then
+            MirrorSystem = LoadRequired("Mirror", RepoConfig.MirrorOverrideUrl .. cacheBust)
+        end
+    end
 end
 
 GlobalEnv[BootstrapStateInfra.RunningKey] = true
@@ -3706,8 +3730,16 @@ end
 
 local function spinGachaOnce()
     if Movement.BeginInteract and not Movement.BeginInteract(function() return not CFG.AutoGacha end) then return nil end
+    if GameClient.Converse then
+        GameClient.Converse("Vox Gacha", "OpenRoulette")
+        task.wait(0.45)
+    end
     local ok, res = pcall(function()
-        if GameModules.Network.SafeInvokeServer then
+        if GameClient.InvokeNet then
+            local iOk, iRes = GameClient.InvokeNet(10, "FruitGacha", "Spin")
+            if iOk then return iRes end
+        end
+        if GameModules and GameModules.Network and GameModules.Network.SafeInvokeServer then
             return GameModules.Network:SafeInvokeServer(10, "FruitGacha", "Spin")
         end
         return GameModules.Network:InvokeServer("FruitGacha", "Spin")
@@ -3766,7 +3798,7 @@ local function autoGacha()
     local snap = Features.PauseForInterrupt and Features.PauseForInterrupt() or { farm = CFG.AutoFarm }
     local res
     pcall(function()
-        if (hrp.Position - gPos).Magnitude > 15 then
+        if (hrp.Position - gPos).Magnitude > 8 then
             Status = "Indo ao Vox Gacha..."
             if not Features.PauseForInterrupt then
                 State.farmToken += 1
@@ -3775,7 +3807,17 @@ local function autoGacha()
             end
             goNear(gPos, function() return not CFG.AutoGacha end)
         end
-        res = spinGachaOnce()
+        local _, hNow = getChar()
+        if CFG.AutoGacha and hNow then
+            local frontCF = GameClient.GetNpcFrontCFrame and GameClient.GetNpcFrontCFrame("Vox Gacha", gPos, 3)
+            if frontCF and (hNow.Position - frontCF.Position).Magnitude > 6 then
+                tweenTo(frontCF, function() return not CFG.AutoGacha end)
+            end
+        end
+        if CFG.AutoGacha then
+            Status = "Girando Vox Gacha..."
+            res = spinGachaOnce()
+        end
         if res then
             if CFG.FruitNotify then notify("🎲 Gacha", "Ganhou: " .. tostring(res)) end
             if CFG.AutoStoreFruit then
@@ -7105,284 +7147,35 @@ Movement.TryEnterGenericInterior = function(pos, aborted)
     return false
 end
 
-local function findMirrorDestination(destPos, targetIslandName)
-    if not (MainModules and MainModules.TravelUtils and destPos) then return nil end
-    -- 0.5: os nomes exibidos divergem dos identificadores internos de Map.Areas e TravelUtils.
-    local resolvedTarget = GameClient.ResolveAreaName and GameClient.ResolveAreaName(targetIslandName)
-    if resolvedTarget then
-        targetIslandName = resolvedTarget
-    end
-    local targetArea = targetIslandName and MainModules.TravelUtils.GetIsland(targetIslandName)
-    if targetArea then
-        local tmc = targetArea:GetAttribute("MapCenter")
-        if typeof(tmc) == "Vector3" and (Vector3.new(tmc.X, 0, tmc.Z) - Vector3.new(destPos.X, 0, destPos.Z)).Magnitude > 2600 then
-            targetArea = nil
-        end
-    end
-    if not targetArea then
-        local areasF = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Areas")
-        if areasF then
-            local bestDiscD, bestDiscArea = math.huge, nil
-            local bestAnyD, bestAnyArea = math.huge, nil
-            local wantSky = destPos.Y > 2500
-            for _, a in ipairs(areasF:GetChildren()) do
-                if MainModules.TravelUtils.IsDestination(a) then
-                    local alt = a:GetAttribute("MapAltitude") or 0
-                    local isSky = alt > 2500
-                    if isSky == wantSky then
-                        local mc = a:GetAttribute("MapCenter")
-                        if typeof(mc) == "Vector3" then
-                            local d = (Vector3.new(mc.X, 0, mc.Z) - Vector3.new(destPos.X, 0, destPos.Z)).Magnitude
-                            local okDisc, isDisc = pcall(MainModules.TravelUtils.IsDiscovered, nil, a.Name)
-                            if okDisc and isDisc then
-                                if d < bestDiscD then bestDiscD, bestDiscArea = d, a end
-                            end
-                            if d < bestAnyD then bestAnyD, bestAnyArea = d, a end
-                        end
-                    end
-                end
-            end
-            targetArea = bestDiscArea or bestAnyArea
-        end
-    end
-    return targetArea
-end
+MirrorSystem.Init({
+    Players = Services.Players,
+    Workspace = workspace,
+    ReplicatedStorage = ReplicatedStorage,
+    GetLocalPlayer = function() return LP end,
+    GetChar = getChar,
+    IsDeadOrRespawning = isDeadOrRespawning,
+    GetData = getData,
+    GetMainModules = function() return MainModules end,
+    GetGameModules = function() return GameModules end,
+    GetPlayability = playability,
+    ResolveAreaName = function(name) return GameClient.ResolveAreaName and GameClient.ResolveAreaName(name) end,
+    ValuePosition = function(val) return GameClient.ValuePosition(val) end,
+    GetInterestPoint = function(key) return GameClient.GetInterestPoint(key) end,
+    GetNpcFrontCFrame = function(npcName, fallbackPos, dist) return GameClient.GetNpcFrontCFrame(npcName, fallbackPos, dist) end,
+    GetDialogueClient = function() return GameClient.GetDialogueClient and GameClient.GetDialogueClient() end,
+    FireNet = function(remoteName, ...) return GameClient.FireNet(remoteName, ...) end,
+    BeginInteract = function(abortFn, minWait) return Movement.BeginInteract(abortFn, minWait) end,
+    WaitPostTeleport = function(waitSec, abortFn, statusMsg) return Movement.WaitPostTeleport(waitSec, abortFn, statusMsg) end,
+    GetPostTeleportWait = function() return Movement.POST_TELEPORT_WAIT end,
+    TweenTo = tweenTo,
+    CancelTween = cancelTween,
+    SetStatus = function(msg) Status = msg end,
+    LogDebug = LogDebug,
+})
 
-Movement.GetMirrorPriceForPos = function(destPos, targetIslandName)
-    local targetArea = findMirrorDestination(destPos, targetIslandName)
-    if not targetArea then return nil end
-    local okDisc, isDisc = pcall(MainModules.TravelUtils.IsDiscovered, nil, targetArea.Name)
-    if not (okDisc and isDisc) then return nil end
-    local price = MainModules.TravelUtils.GetPrice(targetArea)
-    return type(price) == "number" and price or nil
-end
-
-function GameClient.FindMirrorKeeperNear(originPos, maxDist, preferredName, horizontalOnly)
-    if not originPos then return nil end
-    local bestName, bestPos, bestDist = nil, nil, maxDist or math.huge
-    local function consider(name, pos)
-        if not (name and pos) then return end
-        local delta = pos - originPos
-        local dist = horizontalOnly and Vector3.new(delta.X, 0, delta.Z).Magnitude or delta.Magnitude
-        if dist < bestDist then bestName, bestPos, bestDist = name, pos, dist end
-    end
-
-    if preferredName then
-        consider(preferredName, GameClient.ValuePosition(GameClient.GetInterestPoint("Character_" .. preferredName)))
-        if bestName == preferredName then return bestName, bestPos, bestDist end
-    end
-
-    if MainModules and MainModules.TravelUtils and MainModules.TravelUtils.FindKeeper then
-        local ok, keeper = pcall(MainModules.TravelUtils.FindKeeper, originPos)
-        if ok and keeper then consider(keeper.Name, keeper:GetPivot().Position) end
-    end
-
-    local ign = workspace:FindFirstChild("IgnoreList")
-    local shops = ign and ign:FindFirstChild("Int") and ign.Int:FindFirstChild("NPCs") and ign.Int.NPCs:FindFirstChild("Shops")
-    if shops then
-        for _, grp in ipairs(shops:GetChildren()) do
-            for _, npc in ipairs(grp:GetChildren()) do
-                if npc:IsA("Model") and npc.Name:match(" Mirror Keeper$") then
-                    consider(npc.Name, npc:GetPivot().Position)
-                end
-            end
-        end
-    end
-    local points = MainModules and MainModules.InterestPoints and MainModules.InterestPoints.Points
-    if points then
-        for key, point in pairs(points) do
-            if type(key) == "string" and key:match("^Character_.* Mirror Keeper$") then
-                consider(key:sub(11), GameClient.ValuePosition(point))
-            end
-        end
-    end
-    local chars = playability("Characters")
-    if chars then
-        for _, npc in ipairs(chars:GetChildren()) do
-            local original = npc:GetAttribute("OriginalName") or npc.Name
-            if npc:IsA("Model") and original:match(" Mirror Keeper$") then
-                consider(original, npc:GetPivot().Position)
-            end
-        end
-    end
-    return bestName, bestPos, bestDist
-end
-
-local lastMirrorSkipKey, lastMirrorSkipAt = "", 0
-local function logMirrorThrottled(key, msg)
-    local now = os.clock()
-    if key == lastMirrorSkipKey and (now - lastMirrorSkipAt) < 5 then return end
-    lastMirrorSkipKey, lastMirrorSkipAt = key, now
-    LogDebug("mirror_debug.txt", msg)
-end
-
-Movement.TryMirrorKeeperTravel = function(destPos, targetIslandName, abortIf)
-    if not (MainModules and MainModules.TravelUtils) then
-        logMirrorThrottled("no_travelutils", "SKIP: MainModules.TravelUtils indisponível")
-        return false
-    end
-    if isDeadOrRespawning() then return false end
-    local char, hrp = getChar()
-    if not (char and hrp and destPos) then
-        logMirrorThrottled("no_char", "SKIP: sem char/hrp/destPos")
-        return false
-    end
-    local totalDist = (hrp.Position - destPos).Magnitude
-    if totalDist < 3000 then return false end
-    if char:GetAttribute("CarriedChest") ~= nil then
-        logMirrorThrottled("carried_chest", "SKIP: CarriedChest ativo")
-        return false
-    end
-    if char:GetAttribute("BossTether") ~= nil or char:GetAttribute("BossArenaLock") ~= nil then
-        logMirrorThrottled("boss_lock", "SKIP: BossTether/BossArenaLock ativo")
-        return false
-    end
-
-    -- Descobre a ilha de destino pelo nome (validando se destPos pertence a ela) ou pelo MapCenter mais próximo de destPos
-    local targetArea = findMirrorDestination(destPos, targetIslandName)
-    if not targetArea then
-        logMirrorThrottled("no_target:" .. tostring(targetIslandName), ("FAIL: targetArea nil (island=%s dest=(%.0f,%.0f,%.0f))"):format(tostring(targetIslandName), destPos.X, destPos.Y, destPos.Z))
-        return false
-    end
-
-    local targetCenter = targetArea:GetAttribute("MapCenter")
-    local postMirrorDist = nil
-    if typeof(targetCenter) == "Vector3" then
-        local curIslandDist = (Vector3.new(hrp.Position.X, 0, hrp.Position.Z) - Vector3.new(targetCenter.X, 0, targetCenter.Z)).Magnitude
-        local wantSky = destPos.Y > 2500
-        local isSky = (targetArea:GetAttribute("MapAltitude") or 0) > 2500
-        if curIslandDist <= 2600 and wantSky == isSky then
-            logMirrorThrottled("same_island:" .. targetArea.Name, ("SKIP: já está na ilha %s (dist=%.0f)"):format(targetArea.Name, curIslandDist))
-            return false
-        end
-        postMirrorDist = (Vector3.new(targetCenter.X, 0, targetCenter.Z) - Vector3.new(destPos.X, 0, destPos.Z)).Magnitude
-        if postMirrorDist >= totalDist - 1000 then
-            logMirrorThrottled("no_save:" .. targetArea.Name, ("SKIP: Mirror %s não economiza distância (atual=%.0f pós=%.0f)"):format(targetArea.Name, totalDist, postMirrorDist))
-            return false
-        end
-    end
-
-    local okDisc, isDisc = pcall(MainModules.TravelUtils.IsDiscovered, nil, targetArea.Name)
-    if not (okDisc and isDisc) then
-        logMirrorThrottled("undiscovered:" .. targetArea.Name, ("FAIL: ilha não descoberta (%s)"):format(targetArea.Name))
-        return false
-    end
-
-    local price = MainModules.TravelUtils.GetPrice(targetArea)
-    local data = getData()
-    local gold = data and data.Monetization and data.Monetization.Gold
-    if type(gold) ~= "number" or type(price) ~= "number" or gold < price then
-        logMirrorThrottled("no_gold:" .. targetArea.Name, ("FAIL: gold insuficiente (%s < %s) para %s"):format(tostring(gold), tostring(price), targetArea.Name))
-        return false
-    end
-
-    -- Procura o Mirror Keeper da ilha atual (ou mais próximo que o destino)
-    local keeperName, kPos, keeperDist = GameClient.FindMirrorKeeperNear(hrp.Position, math.min(totalDist * 0.65, 6000))
-    if not (keeperName and kPos) then
-        logMirrorThrottled("no_keeper:" .. targetArea.Name, ("FAIL: nenhum Mirror Keeper próximo (dest=%s dist=%.0f)"):format(targetArea.Name, totalDist))
-        return false
-    end
-    if postMirrorDist and (keeperDist + postMirrorDist) >= totalDist - 1000 then
-        logMirrorThrottled("no_save_total:" .. targetArea.Name, ("SKIP: Mirror %s não compensa (direto=%.0f keeper=%.0f pós=%.0f)"):format(targetArea.Name, totalDist, keeperDist, postMirrorDist))
-        return false
-    end
-
-    LogDebug("mirror_debug.txt", ("TRY: keeper=%s (d=%.0f) -> %s (price=%d gold=%d)"):format(keeperName, keeperDist, targetArea.Name, price, gold))
-    Status = ("Mirror Keeper: indo até %s (-%d Gold)..."):format(targetArea.Name, price)
-    local maxKeeperRange = ((MainModules and MainModules.TravelUtils and tonumber(MainModules.TravelUtils.KeeperRange)) or 25) - 3
-    if keeperDist > 6 then
-        task.spawn(function() pcall(function() LP:RequestStreamAroundAsync(kPos) end) end)
-        local tTw = os.clock()
-        tweenTo(GameClient.GetNpcFrontCFrame(keeperName, kPos, 3), abortIf)
-        LogDebug("mirror_debug.txt", ("TWEEN_KEEPER done in %.1fs"):format(os.clock() - tTw))
-        if isDeadOrRespawning() or (abortIf and abortIf()) then
-            LogDebug("mirror_debug.txt", ("ABORT: %s durante tween até keeper %s"):format(isDeadOrRespawning() and "morreu" or "abortado", keeperName))
-            return false
-        end
-        task.wait(0.05)
-    end
-
-    local _, hrpNow = getChar()
-    if isDeadOrRespawning() or not hrpNow then
-        LogDebug("mirror_debug.txt", ("ABORT: morreu/sem HRP antes de falar com keeper %s"):format(keeperName))
-        return false
-    end
-    local distToKeeper = (hrpNow.Position - kPos).Magnitude
-    if distToKeeper > 8 and distToKeeper <= 80 then
-        tweenTo(GameClient.GetNpcFrontCFrame(keeperName, kPos, 2), abortIf)
-        if isDeadOrRespawning() or (abortIf and abortIf()) then
-            LogDebug("mirror_debug.txt", ("ABORT: %s no ajuste fino até keeper %s"):format(isDeadOrRespawning() and "morreu" or "abortado", keeperName))
-            return false
-        end
-        _, hrpNow = getChar()
-        distToKeeper = hrpNow and (hrpNow.Position - kPos).Magnitude or math.huge
-    end
-    if not hrpNow or distToKeeper > maxKeeperRange then
-        LogDebug("mirror_debug.txt", ("ABORT: longe do keeper %s após tween (d=%.0f > %.0f)"):format(keeperName, distToKeeper, maxKeeperRange))
-        return false
-    end
-
-    cancelTween()
-    hrpNow.AssemblyLinearVelocity = Vector3.zero
-    Status = ("Mirror Keeper: viajando até %s..."):format(targetArea.Name)
-    Movement.lastInteractAt = os.clock()
-    local beforePos = hrpNow.Position
-    task.wait(1)
-    for attempt = 1, 2 do
-        if attempt == 2 then
-            local _, hRetry = getChar()
-            if hRetry and (hRetry.Position - kPos).Magnitude > maxKeeperRange then
-                tweenTo(GameClient.GetNpcFrontCFrame(keeperName, kPos, 2), abortIf)
-                cancelTween()
-                if isDeadOrRespawning() or (abortIf and abortIf()) then return false end
-            end
-            LogDebug("mirror_debug.txt", ("RETRY: reenviando Travel para %s via %s"):format(targetArea.Name, keeperName))
-        end
-        LogDebug("mirror_debug.txt", ("ATTEMPT_%d: send Travel"):format(attempt))
-        local dlg = GameClient.GetDialogueClient and GameClient.GetDialogueClient()
-        if dlg and type(dlg.GetBlockReason) == "function" then
-            local okBlk, blkReason = pcall(dlg.GetBlockReason)
-            if okBlk and blkReason then
-                LogDebug("mirror_debug.txt", ("DIALOGUE_BLOCKED reason=%s"):format(tostring(blkReason)))
-                if blkReason == "Converse" then
-                    local stP = GameModules and GameModules.States and GameModules.States.Player and GameModules.States.Player()
-                    if stP and stP.Set then pcall(stP.Set, stP, "Converse", false) end
-                end
-            end
-        end
-        local okTravel, errTravel = GameClient.Converse("Mirror Keeper", "Travel", targetArea.Name)
-        if okTravel then
-            LogDebug("mirror_debug.txt", ("ATTEMPT_%d: Travel sent -> %s"):format(attempt, tostring(targetArea.Name)))
-        else
-            LogDebug("mirror_debug.txt", ("ATTEMPT_%d: Travel failed -> %s (%s)"):format(attempt, tostring(targetArea.Name), tostring(errTravel)))
-        end
-
-        local tWait = os.clock() + (attempt == 1 and 2.0 or 2.5)
-        while os.clock() < tWait do
-            if isDeadOrRespawning() then
-                LogDebug("mirror_debug.txt", ("ABORT: morreu aguardando TP para %s"):format(targetArea.Name))
-                return false
-            end
-            if abortIf and abortIf() then
-                LogDebug("mirror_debug.txt", ("ABORT: aguardando TP para %s"):format(targetArea.Name))
-                return false
-            end
-            local _, hNow = getChar()
-            if hNow and (hNow.Position - beforePos).Magnitude > 1500 then
-                cancelTween()
-                LogDebug("mirror_debug.txt", ("SUCCESS: teleportou para %s (delta=%.0f)"):format(targetArea.Name, (hNow.Position - beforePos).Magnitude))
-                Status = ("Mirror Keeper: chegou em %s (aguardando carregamento)..."):format(targetArea.Name)
-                if not Movement.WaitPostTeleport(Movement.POST_TELEPORT_WAIT, abortIf, ("Mirror Keeper: chegou em %s (aguardando 3s)..."):format(targetArea.Name)) then
-                    return false
-                end
-                return true
-            end
-            task.wait(0.15)
-        end
-    end
-    LogDebug("mirror_debug.txt", ("TIMEOUT: servidor não teleportou para %s via %s"):format(targetArea.Name, keeperName))
-    return false
-end
+Movement.GetMirrorPriceForPos = MirrorSystem.GetPriceForPos
+GameClient.FindMirrorKeeperNear = MirrorSystem.FindKeeperNear
+Movement.TryMirrorKeeperTravel = MirrorSystem.Travel
 
 local BoatSystem = {}
 
@@ -11973,7 +11766,7 @@ function GameClient.LootFortRaid(fortFolder, activeFort, aborted, logFort)
         Status = "Fort Raid: indo ao cofre..."
         goNear(vaultPos + Vector3.new(0, 2, 0), aborted, { noMirror = true })
     end
-    if aborted() then return end
+    if aborted() then return false end
 
     if fortFolder:GetAttribute("VaultOpened") ~= true then
         logFort("VAULT_OPEN_REQUEST fort=" .. tostring(activeFort))
@@ -11985,7 +11778,13 @@ function GameClient.LootFortRaid(fortFolder, activeFort, aborted, logFort)
             task.wait(0.25)
         end
     end
-    if aborted() or fortFolder:GetAttribute("VaultOpened") ~= true then return end
+    if aborted() or fortFolder:GetAttribute("VaultOpened") ~= true then return false end
+
+    local openedAtDeadline = os.clock() + 2
+    while not aborted() and os.clock() < openedAtDeadline and type(fortFolder:GetAttribute("VaultOpenedAt")) ~= "number" do
+        task.wait(0.15)
+    end
+    if aborted() then return false end
 
     GameClient.FireNet("FortRaid", "GetChests")
     local loadDeadline = os.clock() + 5
@@ -12109,6 +11908,7 @@ function GameClient.LootFortRaid(fortFolder, activeFort, aborted, logFort)
         end
     end
     logFort(("LOOT_DONE fort=%s confirmed=%d failed=%d"):format(tostring(activeFort), opened, failed))
+    return not aborted()
 end
 
 function GameClient.StartFortRaidLoop()
@@ -12116,7 +11916,7 @@ function GameClient.StartFortRaidLoop()
     local token = GameClient.FortRaidToken
     task.spawn(function()
         LogDebug("fort_raid_debug.txt", ("=== FORT RAID START level=%s ==="):format(tostring(getLevel())), true)
-        local lastState, lastWave, lootedAt
+        local lastState, lastWave, lootedAt, pendingCompletionUntil
         local function aborted()
             return not CFG.AutoFortRaid or token ~= GameClient.FortRaidToken
         end
@@ -12187,6 +11987,7 @@ function GameClient.StartFortRaidLoop()
                 end
                 lootedAt = nil
                 State.fortRaidLootedAt = nil
+                pendingCompletionUntil = os.clock() + 10
                 local _, hrp = getChar()
                 if hrp and (hrp.Position - activePosition).Magnitude > 650 then
                     Status = "Fort Raid: viajando para " .. activeFort
@@ -12223,17 +12024,23 @@ function GameClient.StartFortRaidLoop()
                     task.wait(0.5)
                 end
             elseif state == "Completed" and type(activeFort) == "string" then
+                pendingCompletionUntil = nil
                 local openedAt = fortFolder:GetAttribute("VaultOpenedAt") or "pending"
                 if lootedAt ~= openedAt then
                     if not State.fortRaidBusy then
                         while not aborted() and (State.bossBusy or State.islandBossBusy) do task.wait(0.5) end
-                if aborted() then break end
-                State.fortRaidBusy = true
+                        if aborted() then break end
+                        State.fortRaidBusy = true
                         GameClient.PauseMainModesForBoss()
                     end
-                    GameClient.LootFortRaid(fortFolder, activeFort, fightAborted, logFort)
-                    lootedAt = fortFolder:GetAttribute("VaultOpenedAt") or openedAt
-                    State.fortRaidLootedAt = lootedAt
+                    local lootOk = GameClient.LootFortRaid(fortFolder, activeFort, fightAborted, logFort)
+                    if lootOk then
+                        lootedAt = fortFolder:GetAttribute("VaultOpenedAt") or openedAt
+                        State.fortRaidLootedAt = lootedAt
+                    else
+                        logFort(("LOOT_RETRY state=%s vaultOpened=%s"):format(tostring(state), tostring(fortFolder:GetAttribute("VaultOpened"))))
+                        task.wait(0.5)
+                    end
                 else
                     releaseFortPriority()
                     if not (CFG.MainModeActive or CFG.AutoMob) then
@@ -12242,6 +12049,12 @@ function GameClient.StartFortRaidLoop()
                     task.wait(1)
                 end
             else
+                if State.fortRaidBusy and pendingCompletionUntil and os.clock() < pendingCompletionUntil then
+                    Status = "Fort Raid: aguardando cofre..."
+                    task.wait(0.25)
+                    continue
+                end
+                pendingCompletionUntil = nil
                 lootedAt = nil
                 State.fortRaidLootedAt = nil
                 releaseFortPriority()
@@ -13448,7 +13261,15 @@ function GameClient.TravelTo(kind, target, aborted)
         local usedMirror = false
         if hrp.Position.Y > -200 and Movement.TryMirrorKeeperTravel then
             LogDebug("travel_debug.txt", ("TRY_MIRROR island=%s"):format(tostring(target)))
-            usedMirror = Movement.TryMirrorKeeperTravel(pos, target, aborted) == true
+            local mOk, mRes = xpcall(function()
+                return Movement.TryMirrorKeeperTravel(pos, target, aborted) == true
+            end, SafeRuntime.Traceback)
+            if not mOk then
+                LogDebug("travel_debug.txt", ("MIRROR_ERR %s"):format(tostring(mRes)))
+                usedMirror = false
+            else
+                usedMirror = mRes == true
+            end
             LogDebug("travel_debug.txt", ("MIRROR_RESULT used=%s"):format(tostring(usedMirror)))
         end
         if aborted and aborted() then
@@ -18160,10 +17981,15 @@ function Shared.BuildMainUI()
                 end
                 travelRunning = true
                 task.spawn(function()
-                    pcall(function()
+                    local tOk, tErr = xpcall(function()
                         if VoxCore.Client.TagMoveThread then VoxCore.Client.TagMoveThread("ManualTravel", 100) end
                         VoxCore.Client.TravelTo(kind, target, function() return travelToken ~= myTok end)
+                    end, function(err)
+                        return tostring(err)
                     end)
+                    if not tOk and VoxCore and VoxCore.Client and VoxCore.Client.LogTravel then
+                        VoxCore.Client.LogTravel("TRAVEL_ERR " .. tostring(tErr))
+                    end
                     if VoxCore.Client.ReleaseMoveLock then VoxCore.Client.ReleaseMoveLock() end
                     if travelToken == myTok then
                         travelRunning = false
@@ -18254,16 +18080,6 @@ function Shared.BuildMainUI()
                     if VoxCore.Client and VoxCore.Client.EnsureSkillsLoop then
                         VoxCore.Client.EnsureSkillsLoop()
                     end
-                end
-            end,
-        })
-
-        UI.TB_Tabs.Combat.Combat:AddToggle("AutoHoldSkillsActive", {
-            Text = "Auto Hold Skills",
-            Default = true,
-            Callback = function(on)
-                if VoxCore and VoxCore.CFG then
-                    VoxCore.CFG.AutoHoldSkills = (on == true)
                 end
             end,
         })
